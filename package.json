@@ -18,7 +18,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build index.ts --outdir dist --target bun --format esm",
+    "bundle": "bun build index.ts --outdir dist --target bun --format esm",
     "typecheck": "tsc --noEmit"
   }
 }
