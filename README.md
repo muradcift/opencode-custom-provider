@@ -25,3 +25,13 @@ Or reference a local checkout in `opencode.jsonc`:
 - **Delete** – removes the provider and its stored key (a backup is taken first).
 
 Keys are kept in `.custom-provider-keys.json` (`0600`) and injected per request. Raw keys never land in the config, no ENV vars or restarts needed.
+
+## Local development
+
+The plugin must be discoverable under `<config>/plugins/`. Point a junction at the checkout (code stays in the repo):
+
+```powershell
+cmd /c mklink /J "%USERPROFILE%\.config\opencode\plugins\custom-provider" "D:\path\to\opencode-custom-provider"
+```
+
+Then restart the service once: `opencode2 service restart`.
