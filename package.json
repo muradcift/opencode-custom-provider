@@ -4,14 +4,21 @@
   "description": "Manage custom OpenAI-compatible providers in OpenCode from the command palette",
   "type": "module",
   "license": "MIT",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./index.ts",
+    ".": "./dist/index.js",
     "./tui": "./tui.tsx"
   },
   "files": [
-    "src"
+    "dist",
+    "src",
+    "index.ts",
+    "tui.tsx",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
+    "build": "bun build index.ts --outdir dist --target bun --format esm",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
