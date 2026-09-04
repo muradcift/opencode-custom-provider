@@ -12,7 +12,7 @@ import {
   validBaseURL,
   validId,
   writeKeyFile,
-} from "./shared.js"
+} from "./src/shared.js"
 
 async function runWizard(ctx: Context) {
   const action = await ctx.ui.dialog.select({

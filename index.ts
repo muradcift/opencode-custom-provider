@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { editProviderModels, injectAuth, removeProvider, scanProviderModels, upsertCustomProvider } from "./shared.js"
+import { editProviderModels, injectAuth, removeProvider, scanProviderModels, upsertCustomProvider } from "./src/shared.js"
 
 export default {
   id: "custom-provider",
