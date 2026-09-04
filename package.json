@@ -5,8 +5,8 @@
   "type": "module",
   "license": "MIT",
   "exports": {
-    ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
   },
   "files": [
     "src"
