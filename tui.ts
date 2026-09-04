@@ -330,20 +330,30 @@ async function deleteFlow(ctx: Context) {
 export default {
   id: "custom-provider-palette",
   setup(ctx: Context) {
-    ctx.keymap.layer(() => ({
-      mode: "global",
-      commands: [
-        {
-          id: "custom-provider.add",
-          title: "Custom provider add/remove",
-          group: "Provider",
-          description: "Add, edit or delete custom OpenAI-compatible providers in opencode.jsonc",
-          palette: true,
-          slash: { name: "custom-provider" },
-          run: () => runWizard(ctx),
-        },
-      ],
-      bindings: ["custom-provider.add"],
-    }))
+    // keymap.layer must run inside a rendered component (it is owned by the
+    // calling component's providers). Calling it directly in setup() throws
+    // "Keymap.Provider is missing". A null-rendering app slot gives us that
+    // context with no JSX, and returning the unsubscribe wires setup cleanup.
+    return ctx.ui.slot({
+      append: "app",
+      render: () => {
+        ctx.keymap.layer(() => ({
+          mode: "global",
+          commands: [
+            {
+              id: "custom-provider.add",
+              title: "Custom provider add/remove",
+              group: "Provider",
+              description: "Add, edit or delete custom OpenAI-compatible providers in opencode.jsonc",
+              palette: true,
+              slash: { name: "custom-provider" },
+              run: () => runWizard(ctx),
+            },
+          ],
+          bindings: ["custom-provider.add"],
+        }))
+        return null
+      },
+    })
   },
 }
