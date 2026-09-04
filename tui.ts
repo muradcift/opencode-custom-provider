@@ -1,6 +1,4 @@
-import { usePlugin } from "@opencode-ai/plugin/tui"
 import type { Context } from "@opencode-ai/plugin/tui/context"
-import fs from "node:fs"
 import {
   deleteKeyFileEntry,
   discoverModels,
@@ -329,29 +327,23 @@ async function deleteFlow(ctx: Context) {
   toast(ctx, `Deleted: ${picked}.`, "success")
 }
 
-function PaletteCommands() {
-  const ctx = usePlugin()
-  ctx.keymap.layer(() => ({
-    mode: "global",
-    commands: [
-      {
-        id: "custom-provider.add",
-        title: "Custom provider add/remove",
-        group: "Provider",
-        description: "Add, edit or delete custom OpenAI-compatible providers in opencode.jsonc",
-        palette: true,
-        slash: { name: "custom-provider" },
-        run: () => runWizard(ctx),
-      },
-    ],
-    bindings: ["custom-provider.add"],
-  }))
-  return null
-}
-
 export default {
   id: "custom-provider-palette",
   setup(ctx: Context) {
-    ctx.ui.slot({ append: "app", render: () => <PaletteCommands /> })
+    ctx.keymap.layer(() => ({
+      mode: "global",
+      commands: [
+        {
+          id: "custom-provider.add",
+          title: "Custom provider add/remove",
+          group: "Provider",
+          description: "Add, edit or delete custom OpenAI-compatible providers in opencode.jsonc",
+          palette: true,
+          slash: { name: "custom-provider" },
+          run: () => runWizard(ctx),
+        },
+      ],
+      bindings: ["custom-provider.add"],
+    }))
   },
 }

@@ -7,13 +7,13 @@
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js",
-    "./tui": "./tui.tsx"
+    "./tui": "./tui.ts"
   },
   "files": [
     "dist",
     "src",
     "index.ts",
-    "tui.tsx",
+    "tui.ts",
     "LICENSE",
     "README.md"
   ],

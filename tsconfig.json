@@ -7,8 +7,6 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "jsx": "react-jsx",
-    "jsxImportSource": "solid-js",
     "allowImportingTsExtensions": true
   },
   "include": ["src"]
