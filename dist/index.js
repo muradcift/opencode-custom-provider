@@ -201,13 +201,20 @@ function upsertCustomProvider(rawArgs) {
         wanted.push(t);
     }
   }
-  const settings = { baseURL };
+  const previous = exists ? config.providers[id] : undefined;
+  const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {};
+  const settings = { ...prevSettings, baseURL };
+  let staleKeyRemoved = false;
   if (args.apiKey) {
     writeKeyFile(id, args.apiKey);
+    delete settings.apiKey;
   } else if (args.apiKeyEnv) {
     settings.apiKey = `{env:${args.apiKeyEnv}}`;
+    if (readKeys()[id] !== undefined) {
+      deleteKeyFileEntry(id);
+      staleKeyRemoved = true;
+    }
   }
-  const previous = exists ? config.providers[id] : undefined;
   const mergedModels = { ...previous && previous.models || {} };
   mergedModels[args.model] = modelEntry;
   for (const m of wanted) {
@@ -215,7 +222,7 @@ function upsertCustomProvider(rawArgs) {
       mergedModels[m] = { name: m };
   }
   config.providers[id] = {
-    name: args.name ?? id,
+    name: args.name ?? previous?.name ?? id,
     package: OPENAI_COMPATIBLE,
     settings,
     models: mergedModels
@@ -235,6 +242,8 @@ function upsertCustomProvider(rawArgs) {
     lines.push("Note: key stored separately (not in config), no restart needed.");
   } else if (args.apiKeyEnv) {
     lines.push(`Note: define the ${args.apiKeyEnv} environment variable; no raw key was written.`);
+    if (staleKeyRemoved)
+      lines.push(`Note: removed the previously stored raw key for ${id}.`);
   }
   lines.push(`Pick ${id}/${args.model} from /models to test.`);
   return lines.join(`

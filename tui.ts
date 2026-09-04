@@ -84,8 +84,7 @@ async function addFlow(ctx: Context) {
   const models = await pickModels(ctx, baseURL, apiKey)
   if (!models || !models.length) return
 
-  if (apiKey) writeKeyFile(id, apiKey)
-  await writeProvider(ctx, { id, baseURL, models })
+  await writeProvider(ctx, { id, baseURL, models, apiKey })
 }
 
 async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promise<string[] | undefined> {
@@ -150,7 +149,10 @@ async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promis
   }
 }
 
-async function writeProvider(ctx: Context, { id, baseURL, models }: { id: string; baseURL: string; models: string[] }) {
+async function writeProvider(
+  ctx: Context,
+  { id, baseURL, models, apiKey }: { id: string; baseURL: string; models: string[]; apiKey: string },
+) {
   const dialog = ctx.ui.dialog
   const file = globalConfigPath()
   let config: Record<string, any>
@@ -176,14 +178,21 @@ async function writeProvider(ctx: Context, { id, baseURL, models }: { id: string
   }
 
   const previous = config.providers[id]
+  // Only touch the key store once the user confirmed. An empty key keeps a
+  // previously stored one; a fresh key replaces it and any env reference.
+  if (apiKey) {
+    writeKeyFile(id, apiKey)
+    if (previous && previous.settings) delete previous.settings.apiKey
+  }
   const mergedModels: Record<string, { name: string }> = { ...((previous && previous.models) || {}) }
   for (const m of models) {
     if (!mergedModels[m]) mergedModels[m] = { name: m }
   }
+  const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {}
   config.providers[id] = {
-    name: id,
+    name: (previous && previous.name) || id,
     package: "@opencode-ai/ai/providers/openai-compatible",
-    settings: { baseURL },
+    settings: { ...prevSettings, baseURL },
     models: mergedModels,
   }
   if (!config.$schema) config.$schema = "https://opencode.ai/config.json"
