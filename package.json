@@ -1,0 +1,23 @@
+{
+  "name": "opencode-custom-provider",
+  "version": "0.1.0",
+  "description": "Manage custom OpenAI-compatible providers in OpenCode from the command palette",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tui": "./src/tui.tsx"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "beta",
+    "@types/node": "^22.0.0",
+    "solid-js": "^1.9.15",
+    "typescript": "^5.8.0"
+  }
+}
