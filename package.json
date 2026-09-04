@@ -20,11 +20,5 @@
   "scripts": {
     "build": "bun build index.ts --outdir dist --target bun --format esm",
     "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@opencode-ai/plugin": "beta",
-    "@types/node": "^22.0.0",
-    "solid-js": "^1.9.15",
-    "typescript": "^5.8.0"
   }
 }

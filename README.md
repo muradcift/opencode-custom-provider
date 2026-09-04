@@ -35,3 +35,9 @@ cmd /c mklink /J "%USERPROFILE%\.config\opencode\plugins\custom-provider" "D:\pa
 ```
 
 Then restart the service once: `opencode2 service restart`.
+
+Dev tooling (`tsc`, types) is intentionally not a dependency so installs stay lean; add it locally when needed:
+
+```sh
+npm install -D typescript @types/node solid-js @opencode-ai/plugin@beta
+```
