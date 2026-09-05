@@ -290,8 +290,7 @@ async function resolveModelsMetaUI(
     return out
   }
   const mode = await dialog.select({
-    title: `Limits for ${pending.length} models`,
-    description: "The provider only reports model IDs, so missing values need input.",
+    title: `Limits for ${pending.length} models (provider reports IDs only)`,
     options: [
       { title: "Same for all — ask once", value: "once" },
       { title: "Per model", value: "per" },
