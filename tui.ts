@@ -199,15 +199,16 @@ async function promptModalities(
   ctx: Context,
   kind: "Input" | "Output",
   id: string,
-): Promise<string[] | undefined> {
+): Promise<{ mods?: string[]; skipped?: boolean } | undefined> {
   const dialog = ctx.ui.dialog
   const presets = kind === "Input" ? INPUT_MODALITY_PRESETS : OUTPUT_MODALITY_PRESETS
   const picked = await dialog.select({
     title: `${kind} modalities — ${id}`,
-    options: presets.map((p) => ({ title: p.title, value: p.value })),
+    options: [...presets.map((p) => ({ title: p.title, value: p.value })), { title: "Skip (use default)", value: "__skip" }],
   })
   if (!picked) return undefined
-  if (picked !== "__manual") return presetModalities(picked)
+  if (picked === "__skip") return { skipped: true }
+  if (picked !== "__manual") return { mods: presetModalities(picked) }
   const manual = await dialog.prompt({
     title: `${kind} modalities — ${id}`,
     description: "Comma-separated, e.g. text, image",
@@ -215,7 +216,30 @@ async function promptModalities(
   })
   if (manual === undefined) return undefined
   const mods = [...new Set(manual.split(",").map((m) => m.trim().toLowerCase()).filter(Boolean))]
-  return mods.length ? mods : ["text"]
+  return { mods: mods.length ? mods : ["text"] }
+}
+
+async function promptTools(
+  ctx: Context,
+  id: string,
+): Promise<{ tools?: boolean; skipped?: boolean } | undefined> {
+  const picked = await ctx.ui.dialog.select({
+    title: `Tool calling — ${id}`,
+    options: [
+      { title: "Yes", value: "yes" },
+      { title: "No", value: "no" },
+      { title: "Skip (use default)", value: "__skip" },
+    ],
+  })
+  if (!picked) return undefined
+  if (picked === "__skip") return { skipped: true }
+  return { tools: picked === "yes" }
+}
+
+// Toast bodies stay short: cap report lines, the full data is in opencode.jsonc.
+function truncateReport(lines: string[], max = 5): string[] {
+  if (lines.length <= max) return lines
+  return [...lines.slice(0, max), `... +${lines.length - max} more (see opencode.jsonc)`]
 }
 
 // Prompt overrides for the pieces `found` doesn't cover. Returns undefined on cancel.
@@ -245,21 +269,19 @@ async function promptMetaOverrides(
     overrides.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
   }
   if (found.tools === undefined) {
-    overrides.tools = await dialog.confirm({
-      title: `Tool calling — ${id}`,
-      message: "Can this model call tools?",
-      label: { confirm: "Yes", cancel: "No" },
-    })
+    const t = await promptTools(ctx, id)
+    if (!t) return undefined
+    if (!t.skipped) overrides.tools = t.tools
   }
   if (found.inputModalities === undefined) {
     const mods = await promptModalities(ctx, "Input", id)
     if (!mods) return undefined
-    overrides.inputModalities = mods
+    if (!mods.skipped) overrides.inputModalities = mods.mods
   }
   if (found.outputModalities === undefined) {
     const mods = await promptModalities(ctx, "Output", id)
     if (!mods) return undefined
-    overrides.outputModalities = mods
+    if (!mods.skipped) overrides.outputModalities = mods.mods
   }
   return overrides
 }
@@ -343,21 +365,19 @@ async function resolveModelsMetaUI(
     shared.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
   }
   if (needTools) {
-    shared.tools = await dialog.confirm({
-      title: `Tool calling — all ${pending.length} models`,
-      message: "Can these models call tools?",
-      label: { confirm: "Yes", cancel: "No" },
-    })
+    const t = await promptTools(ctx, `all ${pending.length} models`)
+    if (!t) return undefined
+    if (!t.skipped) shared.tools = t.tools
   }
   if (needIn) {
     const mods = await promptModalities(ctx, "Input", `all ${pending.length} models`)
     if (!mods) return undefined
-    shared.inputModalities = mods
+    if (!mods.skipped) shared.inputModalities = mods.mods
   }
   if (needOut) {
     const mods = await promptModalities(ctx, "Output", `all ${pending.length} models`)
     if (!mods) return undefined
-    shared.outputModalities = mods
+    if (!mods.skipped) shared.outputModalities = mods.mods
   }
   for (const id of pending) out[id] = resolveModelMeta(raw[id], shared)
   return out
@@ -441,7 +461,7 @@ async function writeProvider(
   }
   await syncCatalog(ctx)
   const report = models.map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
-  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.\n${report.join("\n")}`, "success")
+  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.\n${truncateReport(report).join("\n")}`, "success")
 }
 
 async function editModelsFlow(ctx: Context) {
@@ -553,7 +573,7 @@ async function editModelsFlow(ctx: Context) {
     return
   }
   await syncCatalog(ctx)
-  toast(ctx, `Saved: ${pid} (${current.size} model(s)).\n${report.join("\n")}`, "success")
+  toast(ctx, `Saved: ${pid} (${current.size} model(s)).\n${truncateReport(report).join("\n")}`, "success")
 }
 
 async function deleteFlow(ctx: Context) {
