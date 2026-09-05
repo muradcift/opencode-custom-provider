@@ -218,6 +218,54 @@ async function promptModalities(
   return mods.length ? mods : ["text"]
 }
 
+// Prompt overrides for the pieces `found` doesn't cover. Returns undefined on cancel.
+async function promptMetaOverrides(
+  ctx: Context,
+  id: string,
+  found: ReturnType<typeof extractModelMeta>,
+): Promise<ModelMetaInput | undefined> {
+  const dialog = ctx.ui.dialog
+  const overrides: ModelMetaInput = {}
+  if (found.context === undefined) {
+    const v = await dialog.prompt({
+      title: `Context limit — ${id}`,
+      description: `Total context window tokens (empty = ${FALLBACK_LIMIT.context}).`,
+      placeholder: String(FALLBACK_LIMIT.context),
+    })
+    if (v === undefined) return undefined
+    overrides.contextLimit = parseLimitPrompt(v, FALLBACK_LIMIT.context)
+  }
+  if (found.output === undefined) {
+    const v = await dialog.prompt({
+      title: `Output limit — ${id}`,
+      description: `Max output tokens (empty = ${FALLBACK_LIMIT.output}).`,
+      placeholder: String(FALLBACK_LIMIT.output),
+    })
+    if (v === undefined) return undefined
+    overrides.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
+  }
+  if (found.tools === undefined) {
+    overrides.tools = await dialog.confirm({
+      title: `Tool calling — ${id}`,
+      message: "Can this model call tools?",
+      label: { confirm: "Yes", cancel: "No" },
+    })
+  }
+  if (found.inputModalities === undefined) {
+    const mods = await promptModalities(ctx, "Input", id)
+    if (!mods) return undefined
+    overrides.inputModalities = mods
+  }
+  if (found.outputModalities === undefined) {
+    const mods = await promptModalities(ctx, "Output", id)
+    if (!mods) return undefined
+    overrides.outputModalities = mods
+  }
+  return overrides
+}
+
+type MetaResolved = { capabilities: ModelCapabilities; limit: ModelLimit; sources: MetaSources }
+
 // Resolve explicit limit/capabilities per model. Discovered pieces are used
 // silently; only missing pieces are asked (with OpenCode fallbacks prefilled).
 // Returns undefined when the user cancels.
@@ -226,53 +274,93 @@ async function resolveModelsMetaUI(
   ids: string[],
   raw: Record<string, unknown>,
   skip: Set<string>,
-): Promise<Record<string, { capabilities: ModelCapabilities; limit: ModelLimit; sources: MetaSources }> | undefined> {
+): Promise<Record<string, MetaResolved> | undefined> {
   const dialog = ctx.ui.dialog
-  const out: Record<string, { capabilities: ModelCapabilities; limit: ModelLimit; sources: MetaSources }> = {}
+  const out: Record<string, MetaResolved> = {}
+  const pending = ids.filter((id) => !skip.has(id))
   for (const id of ids) {
-    if (skip.has(id)) {
-      out[id] = resolveModelMeta(raw[id])
-      continue
-    }
-    const found = extractModelMeta(raw[id])
-    const overrides: ModelMetaInput = {}
-    if (found.context === undefined) {
-      const v = await dialog.prompt({
-        title: `Context limit — ${id}`,
-        description: `Total context window tokens (empty = ${FALLBACK_LIMIT.context}).`,
-        placeholder: String(FALLBACK_LIMIT.context),
-      })
-      if (v === undefined) return undefined
-      overrides.contextLimit = parseLimitPrompt(v, FALLBACK_LIMIT.context)
-    }
-    if (found.output === undefined) {
-      const v = await dialog.prompt({
-        title: `Output limit — ${id}`,
-        description: `Max output tokens (empty = ${FALLBACK_LIMIT.output}).`,
-        placeholder: String(FALLBACK_LIMIT.output),
-      })
-      if (v === undefined) return undefined
-      overrides.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
-    }
-    if (found.tools === undefined) {
-      overrides.tools = await dialog.confirm({
-        title: `Tool calling — ${id}`,
-        message: "Can this model call tools?",
-        label: { confirm: "Yes", cancel: "No" },
-      })
-    }
-    if (found.inputModalities === undefined) {
-      const mods = await promptModalities(ctx, "Input", id)
-      if (!mods) return undefined
-      overrides.inputModalities = mods
-    }
-    if (found.outputModalities === undefined) {
-      const mods = await promptModalities(ctx, "Output", id)
-      if (!mods) return undefined
-      overrides.outputModalities = mods
-    }
-    out[id] = resolveModelMeta(raw[id], overrides)
+    if (skip.has(id)) out[id] = resolveModelMeta(raw[id])
   }
+  if (!pending.length) return out
+  if (pending.length === 1) {
+    const id = pending[0]
+    const overrides = await promptMetaOverrides(ctx, id, extractModelMeta(raw[id]))
+    if (!overrides) return undefined
+    out[id] = resolveModelMeta(raw[id], overrides)
+    return out
+  }
+  const mode = await dialog.select({
+    title: `Limits for ${pending.length} models`,
+    description: "The provider only reports model IDs, so missing values need input.",
+    options: [
+      { title: "Same for all — ask once", value: "once" },
+      { title: "Per model", value: "per" },
+      { title: "OpenCode defaults for all — don't ask", value: "defaults" },
+    ],
+  })
+  if (!mode) return undefined
+  if (mode === "defaults") {
+    for (const id of pending) out[id] = resolveModelMeta(raw[id])
+    return out
+  }
+  if (mode === "per") {
+    for (const id of pending) {
+      const overrides = await promptMetaOverrides(ctx, id, extractModelMeta(raw[id]))
+      if (!overrides) return undefined
+      out[id] = resolveModelMeta(raw[id], overrides)
+    }
+    return out
+  }
+  // "once": fields with a unanimous discovered value are used silently,
+  // the rest is asked a single time and applied to every model.
+  const founds = pending.map((id) => extractModelMeta(raw[id]))
+  const unanimous = <T>(pick: (f: ReturnType<typeof extractModelMeta>) => T | undefined): T | undefined => {
+    const first = pick(founds[0])
+    if (first === undefined) return undefined
+    return founds.every((f) => JSON.stringify(pick(f)) === JSON.stringify(first)) ? first : undefined
+  }
+  const shared: ModelMetaInput = {}
+  const needContext = unanimous((f) => f.context) === undefined
+  const needOutput = unanimous((f) => f.output) === undefined
+  const needTools = unanimous((f) => f.tools) === undefined
+  const needIn = unanimous((f) => f.inputModalities) === undefined
+  const needOut = unanimous((f) => f.outputModalities) === undefined
+  if (needContext) {
+    const v = await dialog.prompt({
+      title: `Context limit — all ${pending.length} models`,
+      description: `Total context window tokens (empty = ${FALLBACK_LIMIT.context}).`,
+      placeholder: String(FALLBACK_LIMIT.context),
+    })
+    if (v === undefined) return undefined
+    shared.contextLimit = parseLimitPrompt(v, FALLBACK_LIMIT.context)
+  }
+  if (needOutput) {
+    const v = await dialog.prompt({
+      title: `Output limit — all ${pending.length} models`,
+      description: `Max output tokens (empty = ${FALLBACK_LIMIT.output}).`,
+      placeholder: String(FALLBACK_LIMIT.output),
+    })
+    if (v === undefined) return undefined
+    shared.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
+  }
+  if (needTools) {
+    shared.tools = await dialog.confirm({
+      title: `Tool calling — all ${pending.length} models`,
+      message: "Can these models call tools?",
+      label: { confirm: "Yes", cancel: "No" },
+    })
+  }
+  if (needIn) {
+    const mods = await promptModalities(ctx, "Input", `all ${pending.length} models`)
+    if (!mods) return undefined
+    shared.inputModalities = mods
+  }
+  if (needOut) {
+    const mods = await promptModalities(ctx, "Output", `all ${pending.length} models`)
+    if (!mods) return undefined
+    shared.outputModalities = mods
+  }
+  for (const id of pending) out[id] = resolveModelMeta(raw[id], shared)
   return out
 }
 
