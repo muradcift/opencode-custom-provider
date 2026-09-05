@@ -26,6 +26,12 @@ Or reference a local checkout in `opencode.jsonc`:
 
 Keys are kept in `.custom-provider-keys.json` (`0600`) and injected per request. Raw keys never land in the config, no ENV vars or restarts needed.
 
+Notes:
+
+- Every save rewrites `opencode.jsonc` as plain JSON, so your comments there are lost. A timestamped backup (`opencode.jsonc.bak-*`) is written next to it first.
+- The TUI Add flow only takes a raw key (or empty); for `{env:VAR}`-based auth use the `custom_provider_add` tool with `apiKeyEnv`.
+- After upstream fixes, refresh a git-installed copy with `opencode2 plugin update github:muradcift/opencode-custom-provider`.
+
 ## Local development
 
 The plugin must be discoverable under `<config>/plugins/`. Point a junction at the checkout (code stays in the repo):

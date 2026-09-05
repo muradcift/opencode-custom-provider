@@ -98,6 +98,47 @@ function stripJsonComments(text) {
   }
   return out;
 }
+function stripTrailingCommas(text) {
+  let out = "";
+  let i = 0;
+  let inStr = false;
+  let quote = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (inStr) {
+      out += ch;
+      if (ch === "\\") {
+        out += text[i + 1] ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === quote)
+        inStr = false;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = true;
+      quote = ch;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]))
+        j++;
+      const next = text[j];
+      if (next === "}" || next === "]") {
+        i++;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
 function loadConfig(file) {
   if (!fs.existsSync(file))
     return {};
@@ -105,7 +146,7 @@ function loadConfig(file) {
   try {
     return JSON.parse(raw);
   } catch {
-    return JSON.parse(stripJsonComments(raw));
+    return JSON.parse(stripTrailingCommas(stripJsonComments(raw)));
   }
 }
 function saveConfig(file, config) {
@@ -141,7 +182,12 @@ async function discoverModels(baseURL, apiKey) {
         return { error: "auth" };
       if (!res.ok)
         return { error: `http-${res.status}` };
-      const data = await res.json();
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        return { error: "bad-body" };
+      }
       const ids = (data && data.data || []).map((m) => m && m.id).filter(Boolean);
       const unique = [...new Set(ids)];
       return unique.length ? { ids: unique } : { error: "empty" };
@@ -335,7 +381,7 @@ async function scanProviderModels(rawID) {
     return { error: `"${id}" not found or has no baseURL.` };
   const found = await discoverModels(baseURL, storedKeyFor(id, entry.settings.apiKey));
   if (found.error) {
-    const reason = found.error === "auth" ? "Endpoint requires a key (401)." : found.error === "empty" ? "Endpoint returned an empty list." : found.error === "network" ? "Endpoint unreachable." : `Endpoint error (${found.error}).`;
+    const reason = found.error === "auth" ? "Endpoint requires a key (401)." : found.error === "empty" ? "Endpoint returned an empty list." : found.error === "bad-body" ? "Endpoint answered 200 but not with OpenAI-style JSON." : found.error === "network" ? "Endpoint unreachable." : `Endpoint error (${found.error}).`;
     return { error: reason, baseURL };
   }
   return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL };

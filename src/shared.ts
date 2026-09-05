@@ -130,13 +130,53 @@ function stripJsonComments(text: string): string {
   return out
 }
 
+function stripTrailingCommas(text: string): string {
+  let out = ""
+  let i = 0
+  let inStr = false
+  let quote = ""
+  while (i < text.length) {
+    const ch = text[i]
+    if (inStr) {
+      out += ch
+      if (ch === "\\") {
+        out += text[i + 1] ?? ""
+        i += 2
+        continue
+      }
+      if (ch === quote) inStr = false
+      i++
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      inStr = true
+      quote = ch
+      out += ch
+      i++
+      continue
+    }
+    if (ch === ",") {
+      let j = i + 1
+      while (j < text.length && /\s/.test(text[j])) j++
+      const next = text[j]
+      if (next === "}" || next === "]") {
+        i++
+        continue
+      }
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
 export function loadConfig(file: string): Record<string, any> {
   if (!fs.existsSync(file)) return {}
   const raw = fs.readFileSync(file, "utf8")
   try {
     return JSON.parse(raw)
   } catch {
-    return JSON.parse(stripJsonComments(raw))
+    return JSON.parse(stripTrailingCommas(stripJsonComments(raw)))
   }
 }
 
@@ -189,7 +229,12 @@ export async function discoverModels(baseURL: string, apiKey?: string): Promise<
       const res = await fetch(url, { headers, signal: ctrl.signal })
       if (res.status === 401 || res.status === 403) return { error: "auth" }
       if (!res.ok) return { error: `http-${res.status}` }
-      const data = await res.json()
+      let data: unknown
+      try {
+        data = await res.json()
+      } catch {
+        return { error: "bad-body" }
+      }
       const ids = ((data && (data as any).data) || [])
         .map((m: any) => m && m.id)
         .filter(Boolean)
@@ -399,9 +444,11 @@ export async function scanProviderModels(rawID: string): Promise<ScanResult> {
         ? "Endpoint requires a key (401)."
         : found.error === "empty"
           ? "Endpoint returned an empty list."
-          : found.error === "network"
-            ? "Endpoint unreachable."
-            : `Endpoint error (${found.error}).`
+          : found.error === "bad-body"
+            ? "Endpoint answered 200 but not with OpenAI-style JSON."
+            : found.error === "network"
+              ? "Endpoint unreachable."
+              : `Endpoint error (${found.error}).`
     return { error: reason, baseURL }
   }
   return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL }

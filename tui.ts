@@ -96,9 +96,11 @@ async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promis
         ? "The endpoint requires a key (401). Make sure the key is correct."
         : found.error === "empty"
           ? "The endpoint returned an empty list."
-          : found.error === "network"
-            ? "The endpoint is unreachable."
-            : `The endpoint errored (${found.error}).`
+          : found.error === "bad-body"
+            ? "The endpoint answered 200 but not with OpenAI-style JSON."
+            : found.error === "network"
+              ? "The endpoint is unreachable."
+              : `The endpoint errored (${found.error}).`
     toast(ctx, `Could not fetch the model list: ${why} Enter manually.`)
     const manual = await dialog.prompt({
       title: "Model ID",
