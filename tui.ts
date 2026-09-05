@@ -1,10 +1,12 @@
 import type { Context } from "@opencode-ai/plugin/tui/context"
 import {
+  BASE_SOURCES,
   deleteKeyFileEntry,
   discoverModels,
   ensureModelMeta,
   extractModelMeta,
   FALLBACK_LIMIT,
+  formatMetaReport,
   globalConfigPath,
   listCustomProviders,
   loadConfig,
@@ -14,6 +16,7 @@ import {
   validBaseURL,
   validId,
   writeKeyFile,
+  type MetaSources,
   type ModelCapabilities,
   type ModelEntry,
   type ModelLimit,
@@ -223,9 +226,9 @@ async function resolveModelsMetaUI(
   ids: string[],
   raw: Record<string, unknown>,
   skip: Set<string>,
-): Promise<Record<string, { capabilities: ModelCapabilities; limit: ModelLimit }> | undefined> {
+): Promise<Record<string, { capabilities: ModelCapabilities; limit: ModelLimit; sources: MetaSources }> | undefined> {
   const dialog = ctx.ui.dialog
-  const out: Record<string, { capabilities: ModelCapabilities; limit: ModelLimit }> = {}
+  const out: Record<string, { capabilities: ModelCapabilities; limit: ModelLimit; sources: MetaSources }> = {}
   for (const id of ids) {
     if (skip.has(id)) {
       out[id] = resolveModelMeta(raw[id])
@@ -324,9 +327,15 @@ async function writeProvider(
   const metas = await resolveModelsMetaUI(ctx, models, raw, configured)
   if (!metas) return
   const mergedModels: Record<string, ModelEntry> = { ...((previous && previous.models) || {}) }
+  const reportSources: Record<string, MetaSources> = {}
   for (const m of models) {
-    if (!mergedModels[m]) mergedModels[m] = { name: m, ...metas[m] }
-    else ensureModelMeta(mergedModels[m], raw[m])
+    if (!mergedModels[m]) {
+      mergedModels[m] = { name: m, capabilities: metas[m].capabilities, limit: metas[m].limit }
+      reportSources[m] = metas[m].sources
+    } else {
+      ensureModelMeta(mergedModels[m], raw[m])
+      reportSources[m] = BASE_SOURCES
+    }
   }
   const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {}
   config.providers[id] = {
@@ -344,7 +353,8 @@ async function writeProvider(
     return
   }
   await syncCatalog(ctx)
-  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.`, "success")
+  const report = models.map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
+  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.\n${report.join("\n")}`, "success")
 }
 
 async function editModelsFlow(ctx: Context) {
@@ -427,6 +437,7 @@ async function editModelsFlow(ctx: Context) {
     await dialog.alert({ title: "Cannot be empty", message: "At least 1 model must remain. Use Delete to remove the provider." })
     return
   }
+  let report: string[] = []
   try {
     const file = globalConfigPath()
     const config = loadConfig(file)
@@ -436,19 +447,26 @@ async function editModelsFlow(ctx: Context) {
     const metas = await resolveModelsMetaUI(ctx, added, discoveredRaw, new Set())
     if (!metas) return
     const models: Record<string, ModelEntry> = {}
+    const reportSources: Record<string, MetaSources> = {}
     for (const m of current) {
       const kept = target.models && (target.models as Record<string, ModelEntry>)[m]
-      if (kept) models[m] = ensureModelMeta({ ...kept }, discoveredRaw[m])
-      else models[m] = { name: m, ...metas[m] }
+      if (kept) {
+        models[m] = ensureModelMeta({ ...kept }, discoveredRaw[m])
+        reportSources[m] = BASE_SOURCES
+      } else {
+        models[m] = { name: m, capabilities: metas[m].capabilities, limit: metas[m].limit }
+        reportSources[m] = metas[m].sources
+      }
     }
     target.models = models
+    report = [...current].map((m) => formatMetaReport(`${pid}/${m}`, models[m], reportSources[m]))
     saveConfig(file, config)
   } catch (e) {
     await dialog.alert({ title: "Cannot write", message: (e as Error).message })
     return
   }
   await syncCatalog(ctx)
-  toast(ctx, `Saved: ${pid} (${current.size} model(s)).`, "success")
+  toast(ctx, `Saved: ${pid} (${current.size} model(s)).\n${report.join("\n")}`, "success")
 }
 
 async function deleteFlow(ctx: Context) {

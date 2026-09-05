@@ -110,28 +110,59 @@ function extractModelMeta(raw) {
   }
   return meta;
 }
+var BASE_SOURCES = {
+  context: "base",
+  input: "base",
+  output: "base",
+  tools: "base",
+  in: "base",
+  out: "base"
+};
 function resolveModelMeta(raw, overrides, base) {
   const found = raw === undefined ? {} : extractModelMeta(raw);
   const o = overrides ?? {};
   const num = (v) => validLimit(v);
-  const context = num(o.contextLimit) ?? base?.limit?.context ?? found.context ?? FALLBACK_LIMIT.context;
-  const output = num(o.outputLimit) ?? base?.limit?.output ?? found.output ?? FALLBACK_LIMIT.output;
-  const input = num(o.inputLimit) ?? base?.limit?.input ?? found.input;
   const cleanArr = (v) => {
     if (v === undefined)
       return;
-    const mods = validModalities(v);
-    return mods;
+    return validModalities(v);
   };
+  const hasExplicit = (v) => v !== undefined;
+  const pickSource = (explicit, baseV, foundV) => explicit ? "explicit" : baseV !== undefined ? "base" : foundV !== undefined ? "discovered" : "fallback";
+  const contextExplicit = num(o.contextLimit);
+  const outputExplicit = num(o.outputLimit);
+  const inputExplicit = num(o.inputLimit);
+  const toolsExplicit = typeof o.tools === "boolean" ? o.tools : undefined;
+  const inExplicit = cleanArr(o.inputModalities);
+  const outExplicit = cleanArr(o.outputModalities);
+  const context = contextExplicit ?? base?.limit?.context ?? found.context ?? FALLBACK_LIMIT.context;
+  const output = outputExplicit ?? base?.limit?.output ?? found.output ?? FALLBACK_LIMIT.output;
+  const input = inputExplicit ?? base?.limit?.input ?? found.input;
+  const tools = toolsExplicit ?? base?.capabilities?.tools ?? found.tools ?? FALLBACK_CAPABILITIES.tools;
+  const inMods = inExplicit ?? base?.capabilities?.input ?? found.inputModalities ?? [...FALLBACK_CAPABILITIES.input];
+  const outMods = outExplicit ?? base?.capabilities?.output ?? found.outputModalities ?? [...FALLBACK_CAPABILITIES.output];
   const limit = input === undefined ? { context, output } : { context, input, output };
   return {
-    capabilities: {
-      tools: typeof o.tools === "boolean" ? o.tools : base?.capabilities?.tools ?? found.tools ?? FALLBACK_CAPABILITIES.tools,
-      input: cleanArr(o.inputModalities) ?? base?.capabilities?.input ?? found.inputModalities ?? [...FALLBACK_CAPABILITIES.input],
-      output: cleanArr(o.outputModalities) ?? base?.capabilities?.output ?? found.outputModalities ?? [...FALLBACK_CAPABILITIES.output]
-    },
-    limit
+    capabilities: { tools, input: inMods, output: outMods },
+    limit,
+    sources: {
+      context: pickSource(hasExplicit(contextExplicit), base?.limit?.context, found.context),
+      input: pickSource(hasExplicit(inputExplicit), base?.limit?.input, found.input),
+      output: pickSource(hasExplicit(outputExplicit), base?.limit?.output, found.output),
+      tools: pickSource(hasExplicit(toolsExplicit), base?.capabilities?.tools, found.tools),
+      in: pickSource(hasExplicit(inExplicit), base?.capabilities?.input, found.inputModalities),
+      out: pickSource(hasExplicit(outExplicit), base?.capabilities?.output, found.outputModalities)
+    }
   };
+}
+function formatMetaReport(id, entry, sources) {
+  const limit = entry.limit ?? { context: FALLBACK_LIMIT.context, output: FALLBACK_LIMIT.output };
+  const mark = (s) => s === "fallback" ? " (default)" : "";
+  const parts = [`context ${limit.context}${mark(sources?.context)}`];
+  if (limit.input !== undefined)
+    parts.push(`input ${limit.input}${mark(sources?.input)}`);
+  parts.push(`output ${limit.output}${mark(sources?.output)}`);
+  return `- ${id}: ${parts.join(", ")}`;
 }
 function ensureModelMeta(entry, raw, overrides) {
   if (!entry.capabilities || !entry.limit) {
@@ -406,10 +437,13 @@ function upsertCustomProvider(rawArgs) {
   const previous = exists ? config.providers[id] : undefined;
   const modelUpstream = args.modelUpstream ?? args.model;
   const prevModel = previous && previous.models ? previous.models[args.model] : undefined;
+  const primaryResolved = resolveModelMeta(undefined, providerInputMeta(args), prevModel);
   const modelEntry = {
     name: args.modelName ?? prevModel?.name ?? args.model,
-    ...resolveModelMeta(undefined, providerInputMeta(args), prevModel)
+    capabilities: primaryResolved.capabilities,
+    limit: primaryResolved.limit
   };
+  const reportSources = { [args.model]: primaryResolved.sources };
   if (modelUpstream !== args.model)
     modelEntry.modelID = modelUpstream;
   else if (prevModel?.modelID)
@@ -439,10 +473,15 @@ function upsertCustomProvider(rawArgs) {
   mergedModels[args.model] = modelEntry;
   for (const m of wanted) {
     const cur = mergedModels[m];
-    if (!cur)
-      mergedModels[m] = { name: m, ...resolveModelMeta() };
-    else
+    if (!cur) {
+      const r = resolveModelMeta();
+      mergedModels[m] = { name: m, capabilities: r.capabilities, limit: r.limit };
+      reportSources[m] = r.sources;
+    } else {
       ensureModelMeta(cur);
+      if (!reportSources[m])
+        reportSources[m] = BASE_SOURCES;
+    }
   }
   config.providers[id] = {
     name: args.name ?? previous?.name ?? id,
@@ -459,7 +498,9 @@ function upsertCustomProvider(rawArgs) {
   }
   const lines = [
     `${exists ? "Updated" : "Added"}: providers.${id} -> ${file}`,
-    `Models: ${wanted.map((m) => `${id}/${m}`).join(", ")}` + (modelUpstream !== args.model ? ` (upstream: ${modelUpstream})` : "")
+    `Models: ${wanted.map((m) => `${id}/${m}`).join(", ")}` + (modelUpstream !== args.model ? ` (upstream: ${modelUpstream})` : ""),
+    "Limits:",
+    ...wanted.map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
   ];
   if (args.apiKey) {
     lines.push("Note: key stored separately (not in config), no restart needed.");
@@ -514,14 +555,21 @@ function editProviderModels(rawID, add, remove, meta) {
   const models = { ...entry.models || {} };
   const norm = (v) => trimString(v);
   const hasMeta = meta !== undefined && Object.values(meta).some((v) => v !== undefined);
-  for (const m of (Array.isArray(add) ? add : []).map(norm).filter(Boolean)) {
+  const added = (Array.isArray(add) ? add : []).map(norm).filter(Boolean);
+  const reportSources = {};
+  for (const m of added) {
     const cur = models[m];
     if (!cur) {
-      models[m] = { name: m, ...resolveModelMeta(undefined, meta) };
+      const r = resolveModelMeta(undefined, meta);
+      models[m] = { name: m, capabilities: r.capabilities, limit: r.limit };
+      reportSources[m] = r.sources;
     } else if (hasMeta) {
-      models[m] = { ...cur, ...resolveModelMeta(undefined, meta, cur) };
+      const r = resolveModelMeta(undefined, meta, cur);
+      models[m] = { ...cur, capabilities: r.capabilities, limit: r.limit };
+      reportSources[m] = r.sources;
     } else {
       ensureModelMeta(cur);
+      reportSources[m] = BASE_SOURCES;
     }
   }
   for (const m of (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)) {
@@ -536,7 +584,14 @@ function editProviderModels(rawID, add, remove, meta) {
   } catch (e) {
     return `Error: cannot write config (${file}): ${e.message}`;
   }
-  return `Updated: ${id} -> ${Object.keys(models).length} model(s) (${Object.keys(models).join(", ").slice(0, 300)})`;
+  const out = [`Updated: ${id} -> ${Object.keys(models).length} model(s) (${Object.keys(models).join(", ").slice(0, 300)})`];
+  if (added.length) {
+    out.push("Limits:");
+    for (const m of added)
+      out.push(formatMetaReport(`${id}/${m}`, models[m], reportSources[m]));
+  }
+  return out.join(`
+`);
 }
 function storedKeyFor(providerID, settingsApiKey) {
   const stored = readKeys()[providerID];
