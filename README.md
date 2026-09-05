@@ -31,6 +31,7 @@ Notes:
 - Every save rewrites `opencode.jsonc` as plain JSON, so your comments there are lost. A timestamped backup (`opencode.jsonc.bak-*`) is written next to it first.
 - The TUI Add flow only takes a raw key (or empty); for `{env:VAR}`-based auth use the `custom_provider_add` tool with `apiKeyEnv`.
 - After upstream fixes, refresh a git-installed copy with `opencode2 plugin update github:muradcift/opencode-custom-provider`.
+- Each model is stored with explicit `limit` (context/output, input when known) and `capabilities` (tools, input/output modalities). Values are scraped from `/models` extras when the server provides them (e.g. `max_model_len`, `context_length`); anything missing is asked in the TUI or falls back to OpenCode defaults (200000 context, 32000 output), written out explicitly.
 
 ## Local development
 

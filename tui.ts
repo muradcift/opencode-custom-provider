@@ -2,14 +2,22 @@ import type { Context } from "@opencode-ai/plugin/tui/context"
 import {
   deleteKeyFileEntry,
   discoverModels,
+  ensureModelMeta,
+  extractModelMeta,
+  FALLBACK_LIMIT,
   globalConfigPath,
   listCustomProviders,
   loadConfig,
   readKeys,
+  resolveModelMeta,
   saveConfig,
   validBaseURL,
   validId,
   writeKeyFile,
+  type ModelCapabilities,
+  type ModelEntry,
+  type ModelLimit,
+  type ModelMetaInput,
 } from "./src/shared.js"
 
 async function runWizard(ctx: Context) {
@@ -81,13 +89,17 @@ async function addFlow(ctx: Context) {
   if (rawKey === undefined) return
   const apiKey = rawKey.trim()
 
-  const models = await pickModels(ctx, baseURL, apiKey)
-  if (!models || !models.length) return
+  const picked = await pickModels(ctx, baseURL, apiKey)
+  if (!picked || !picked.models.length) return
 
-  await writeProvider(ctx, { id, baseURL, models, apiKey })
+  await writeProvider(ctx, { id, baseURL, models: picked.models, raw: picked.raw, apiKey })
 }
 
-async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promise<string[] | undefined> {
+async function pickModels(
+  ctx: Context,
+  baseURL: string,
+  apiKey: string,
+): Promise<{ models: string[]; raw: Record<string, unknown> } | undefined> {
   const dialog = ctx.ui.dialog
   const found = await discoverModels(baseURL, apiKey || undefined)
   if (!found.ids) {
@@ -108,9 +120,11 @@ async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promis
       placeholder: "coder",
     })
     const m = (manual || "").trim()
-    return m ? [m] : undefined
+    return m ? { models: [m], raw: {} } : undefined
   }
   const ids = found.ids
+  const raw = found.raw ?? {}
+  const done = (models: string[]) => ({ models, raw })
   const selected: string[] = []
   let remaining = [...ids]
   for (;;) {
@@ -124,14 +138,14 @@ async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promis
         { title: "Enter manually...", value: "__manual" },
       ],
     })
-    if (!picked || picked === "__done") return selected.length ? selected : undefined
+    if (!picked || picked === "__done") return selected.length ? done(selected) : undefined
     if (picked === "__all") {
       const okAll = await dialog.confirm({
         title: `Add all ${ids.length} models?`,
         message: "All of them will be written to the config.",
         label: { confirm: "Add all", cancel: "Cancel" },
       })
-      if (okAll) return ids
+      if (okAll) return done(ids)
       continue
     }
     if (picked === "__manual") {
@@ -143,17 +157,137 @@ async function pickModels(ctx: Context, baseURL: string, apiKey: string): Promis
       const m = (manual || "").trim()
       if (m && !selected.includes(m)) selected.push(m)
       if (!selected.length) continue
-      return selected
+      return done(selected)
     }
     if (!selected.includes(picked)) selected.push(picked)
     remaining = remaining.filter((m) => m !== picked)
-    if (!remaining.length) return selected
+    if (!remaining.length) return done(selected)
   }
+}
+
+function parseLimitPrompt(value: string, fallback: number): number {
+  const t = value.trim().replace(/_/g, "")
+  if (!t) return fallback
+  const n = Number(t)
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : fallback
+}
+
+const INPUT_MODALITY_PRESETS: Array<{ title: string; value: string }> = [
+  { title: "text", value: "text" },
+  { title: "text + image", value: "text+image" },
+  { title: "text + image + audio", value: "text+image+audio" },
+  { title: "Enter manually...", value: "__manual" },
+]
+
+const OUTPUT_MODALITY_PRESETS: Array<{ title: string; value: string }> = [
+  { title: "text", value: "text" },
+  { title: "text + image", value: "text+image" },
+  { title: "Enter manually...", value: "__manual" },
+]
+
+function presetModalities(value: string): string[] {
+  return value
+    .split("+")
+    .map((m) => m.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+async function promptModalities(
+  ctx: Context,
+  kind: "Input" | "Output",
+  id: string,
+): Promise<string[] | undefined> {
+  const dialog = ctx.ui.dialog
+  const presets = kind === "Input" ? INPUT_MODALITY_PRESETS : OUTPUT_MODALITY_PRESETS
+  const picked = await dialog.select({
+    title: `${kind} modalities — ${id}`,
+    options: presets.map((p) => ({ title: p.title, value: p.value })),
+  })
+  if (!picked) return undefined
+  if (picked !== "__manual") return presetModalities(picked)
+  const manual = await dialog.prompt({
+    title: `${kind} modalities — ${id}`,
+    description: "Comma-separated, e.g. text, image",
+    placeholder: "text, image",
+  })
+  if (manual === undefined) return undefined
+  const mods = [...new Set(manual.split(",").map((m) => m.trim().toLowerCase()).filter(Boolean))]
+  return mods.length ? mods : ["text"]
+}
+
+// Resolve explicit limit/capabilities per model. Discovered pieces are used
+// silently; only missing pieces are asked (with OpenCode fallbacks prefilled).
+// Returns undefined when the user cancels.
+async function resolveModelsMetaUI(
+  ctx: Context,
+  ids: string[],
+  raw: Record<string, unknown>,
+  skip: Set<string>,
+): Promise<Record<string, { capabilities: ModelCapabilities; limit: ModelLimit }> | undefined> {
+  const dialog = ctx.ui.dialog
+  const out: Record<string, { capabilities: ModelCapabilities; limit: ModelLimit }> = {}
+  for (const id of ids) {
+    if (skip.has(id)) {
+      out[id] = resolveModelMeta(raw[id])
+      continue
+    }
+    const found = extractModelMeta(raw[id])
+    const overrides: ModelMetaInput = {}
+    if (found.context === undefined) {
+      const v = await dialog.prompt({
+        title: `Context limit — ${id}`,
+        description: `Total context window tokens (empty = ${FALLBACK_LIMIT.context}).`,
+        placeholder: String(FALLBACK_LIMIT.context),
+      })
+      if (v === undefined) return undefined
+      overrides.contextLimit = parseLimitPrompt(v, FALLBACK_LIMIT.context)
+    }
+    if (found.output === undefined) {
+      const v = await dialog.prompt({
+        title: `Output limit — ${id}`,
+        description: `Max output tokens (empty = ${FALLBACK_LIMIT.output}).`,
+        placeholder: String(FALLBACK_LIMIT.output),
+      })
+      if (v === undefined) return undefined
+      overrides.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
+    }
+    if (found.tools === undefined) {
+      overrides.tools = await dialog.confirm({
+        title: `Tool calling — ${id}`,
+        message: "Can this model call tools?",
+        label: { confirm: "Yes", cancel: "No" },
+      })
+    }
+    if (found.inputModalities === undefined) {
+      const mods = await promptModalities(ctx, "Input", id)
+      if (!mods) return undefined
+      overrides.inputModalities = mods
+    }
+    if (found.outputModalities === undefined) {
+      const mods = await promptModalities(ctx, "Output", id)
+      if (!mods) return undefined
+      overrides.outputModalities = mods
+    }
+    out[id] = resolveModelMeta(raw[id], overrides)
+  }
+  return out
 }
 
 async function writeProvider(
   ctx: Context,
-  { id, baseURL, models, apiKey }: { id: string; baseURL: string; models: string[]; apiKey: string },
+  {
+    id,
+    baseURL,
+    models,
+    raw,
+    apiKey,
+  }: {
+    id: string
+    baseURL: string
+    models: string[]
+    raw: Record<string, unknown>
+    apiKey: string
+  },
 ) {
   const dialog = ctx.ui.dialog
   const file = globalConfigPath()
@@ -186,9 +320,13 @@ async function writeProvider(
     writeKeyFile(id, apiKey)
     if (previous && previous.settings) delete previous.settings.apiKey
   }
-  const mergedModels: Record<string, { name: string }> = { ...((previous && previous.models) || {}) }
+  const configured = new Set(Object.keys((previous && previous.models) || {}))
+  const metas = await resolveModelsMetaUI(ctx, models, raw, configured)
+  if (!metas) return
+  const mergedModels: Record<string, ModelEntry> = { ...((previous && previous.models) || {}) }
   for (const m of models) {
-    if (!mergedModels[m]) mergedModels[m] = { name: m }
+    if (!mergedModels[m]) mergedModels[m] = { name: m, ...metas[m] }
+    else ensureModelMeta(mergedModels[m], raw[m])
   }
   const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {}
   config.providers[id] = {
@@ -238,10 +376,12 @@ async function editModelsFlow(ctx: Context) {
   const stored = readKeys()[pid]
   const key = typeof stored === "string" && stored ? stored : undefined
   let discovered: string[] = []
+  let discoveredRaw: Record<string, unknown> = {}
   if (baseURL) {
     const r = await discoverModels(baseURL, key)
     if (r.ids) {
       discovered = r.ids
+      discoveredRaw = r.raw ?? {}
     } else {
       toast(ctx, r.error === "auth" ? "Endpoint requires a key, continuing with the current list." : "List unavailable, continuing with the current list.")
     }
@@ -291,9 +431,15 @@ async function editModelsFlow(ctx: Context) {
     const file = globalConfigPath()
     const config = loadConfig(file)
     const target = config.providers[pid]
-    const models: Record<string, { name: string }> = {}
+    const original = new Set(Object.keys((target.models as Record<string, ModelEntry>) || {}))
+    const added = [...current].filter((m) => !original.has(m))
+    const metas = await resolveModelsMetaUI(ctx, added, discoveredRaw, new Set())
+    if (!metas) return
+    const models: Record<string, ModelEntry> = {}
     for (const m of current) {
-      models[m] = (target.models && target.models[m]) || { name: m }
+      const kept = target.models && (target.models as Record<string, ModelEntry>)[m]
+      if (kept) models[m] = ensureModelMeta({ ...kept }, discoveredRaw[m])
+      else models[m] = { name: m, ...metas[m] }
     }
     target.models = models
     saveConfig(file, config)

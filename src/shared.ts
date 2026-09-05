@@ -2,9 +2,23 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
+export interface ModelCapabilities {
+  tools: boolean
+  input: string[]
+  output: string[]
+}
+
+export interface ModelLimit {
+  context: number
+  input?: number
+  output: number
+}
+
 export interface ModelEntry {
   name: string
   modelID?: string
+  capabilities?: ModelCapabilities
+  limit?: ModelLimit
 }
 
 export interface ProviderEntry {
@@ -28,6 +42,182 @@ export interface ProviderInput {
   apiKeyEnv?: string
   apiKey?: string
   overwrite?: boolean
+  contextLimit?: number
+  outputLimit?: number
+  inputLimit?: number
+  tools?: boolean
+  inputModalities?: string[]
+  outputModalities?: string[]
+}
+
+export interface ModelMetaInput {
+  contextLimit?: number
+  outputLimit?: number
+  inputLimit?: number
+  tools?: boolean
+  inputModalities?: string[]
+  outputModalities?: string[]
+}
+
+// OpenCode fallback metadata for models outside its catalog (see docs/models):
+// 200k context, 32k output, unspecified input, tools + text/image in, text out.
+// We write these explicitly instead of relying on the implicit fallback.
+export const FALLBACK_LIMIT = { context: 200000, output: 32000 } as const
+export const FALLBACK_CAPABILITIES: ModelCapabilities = { tools: true, input: ["text", "image"], output: ["text"] }
+
+// Partially discovered per-model metadata scraped from /models item extras.
+// Standard OpenAI items carry only `id`; some servers volunteer more.
+export interface DiscoveredMeta {
+  context?: number
+  input?: number
+  output?: number
+  tools?: boolean
+  inputModalities?: string[]
+  outputModalities?: string[]
+}
+
+const CONTEXT_KEYS = [
+  "max_model_len",
+  "max_context_length",
+  "context_length",
+  "context_window",
+  "contextLength",
+  "max_context",
+  "n_ctx",
+]
+const OUTPUT_KEYS = ["max_output_tokens", "max_completion_tokens", "max_tokens", "max_new_tokens"]
+const INPUT_KEYS = ["max_input_tokens", "max_prompt_tokens"]
+const TOOLS_BOOL_KEYS = ["supports_tools", "function_calling"]
+const INPUT_MOD_KEYS = ["input_modalities", "inputModalities"]
+const OUTPUT_MOD_KEYS = ["output_modalities", "outputModalities"]
+
+function validLimit(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined
+  return Math.trunc(value)
+}
+
+function validModalities(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out = [...new Set(value.map((v) => (typeof v === "string" ? v.trim().toLowerCase() : "")).filter(Boolean))]
+  return out.length ? out : undefined
+}
+
+function scrapeMetaBag(bag: Record<string, any>): DiscoveredMeta {
+  const meta: DiscoveredMeta = {}
+  const pickNum = (keys: string[]): number | undefined => {
+    for (const k of keys) {
+      const v = validLimit(bag[k])
+      if (v !== undefined) return v
+    }
+    return undefined
+  }
+  const context = pickNum(CONTEXT_KEYS)
+  if (context !== undefined) meta.context = context
+  const output = pickNum(OUTPUT_KEYS)
+  if (output !== undefined) meta.output = output
+  const input = pickNum(INPUT_KEYS)
+  if (input !== undefined) meta.input = input
+  for (const k of TOOLS_BOOL_KEYS) {
+    if (typeof bag[k] === "boolean") {
+      meta.tools = bag[k]
+      break
+    }
+  }
+  if (Array.isArray(bag.supported_parameters)) {
+    const params = bag.supported_parameters.map((p: unknown) => String(p).toLowerCase())
+    if (params.includes("tools") || params.includes("tool_choice")) meta.tools = true
+  }
+  for (const k of INPUT_MOD_KEYS) {
+    const mods = validModalities(bag[k])
+    if (mods) {
+      meta.inputModalities = mods
+      break
+    }
+  }
+  for (const k of OUTPUT_MOD_KEYS) {
+    const mods = validModalities(bag[k])
+    if (mods) {
+      meta.outputModalities = mods
+      break
+    }
+  }
+  if (!meta.inputModalities) {
+    const flat = validModalities(bag.modalities)
+    if (flat) meta.inputModalities = flat
+  }
+  if ((!meta.inputModalities || !meta.outputModalities) && typeof bag.modality === "string") {
+    // OpenRouter-style "text+image->text"
+    const sides = bag.modality.split("->").map((s: string) =>
+      [...new Set(s.split("+").map((m) => m.trim().toLowerCase()).filter(Boolean))],
+    )
+    if (sides[0]?.length && !meta.inputModalities) meta.inputModalities = sides[0]
+    if (sides[1]?.length && !meta.outputModalities) meta.outputModalities = sides[1]
+  }
+  if (bag.vision === true && meta.inputModalities && !meta.inputModalities.includes("image")) {
+    meta.inputModalities = [...meta.inputModalities, "image"]
+  } else if (bag.vision === true && !meta.inputModalities) {
+    meta.inputModalities = ["text", "image"]
+  }
+  return meta
+}
+
+export function extractModelMeta(raw: unknown): DiscoveredMeta {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+  const bag = raw as Record<string, any>
+  const meta = scrapeMetaBag(bag)
+  for (const nestKey of ["meta", "architecture"]) {
+    const nested = bag[nestKey]
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const inner = scrapeMetaBag(nested as Record<string, any>)
+      for (const [k, v] of Object.entries(inner)) {
+        if ((meta as Record<string, unknown>)[k] === undefined) (meta as Record<string, unknown>)[k] = v
+      }
+    }
+  }
+  return meta
+}
+
+// Precedence: explicit overrides > existing entry blocks > discovered > explicit OpenCode fallbacks.
+export function resolveModelMeta(
+  raw?: unknown,
+  overrides?: ModelMetaInput,
+  base?: Pick<ModelEntry, "capabilities" | "limit">,
+): { capabilities: ModelCapabilities; limit: ModelLimit } {
+  const found = raw === undefined ? {} : extractModelMeta(raw)
+  const o = overrides ?? {}
+  const num = (v: unknown): number | undefined => validLimit(v)
+  const context = num(o.contextLimit) ?? base?.limit?.context ?? found.context ?? FALLBACK_LIMIT.context
+  const output = num(o.outputLimit) ?? base?.limit?.output ?? found.output ?? FALLBACK_LIMIT.output
+  const input = num(o.inputLimit) ?? base?.limit?.input ?? found.input
+  const cleanArr = (v: unknown): string[] | undefined => {
+    if (v === undefined) return undefined
+    const mods = validModalities(v)
+    return mods
+  }
+  const limit: ModelLimit =
+    input === undefined ? { context, output } : { context, input, output }
+  return {
+    capabilities: {
+      tools: typeof o.tools === "boolean" ? o.tools : (base?.capabilities?.tools ?? found.tools ?? FALLBACK_CAPABILITIES.tools),
+      input: cleanArr(o.inputModalities) ?? base?.capabilities?.input ?? found.inputModalities ?? [...FALLBACK_CAPABILITIES.input],
+      output: cleanArr(o.outputModalities) ?? base?.capabilities?.output ?? found.outputModalities ?? [...FALLBACK_CAPABILITIES.output],
+    },
+    limit,
+  }
+}
+
+// Fill missing capabilities/limit blocks without touching present ones.
+export function ensureModelMeta(
+  entry: ModelEntry,
+  raw?: unknown,
+  overrides?: ModelMetaInput,
+): ModelEntry {
+  if (!entry.capabilities || !entry.limit) {
+    const resolved = resolveModelMeta(raw, overrides, entry)
+    if (!entry.capabilities) entry.capabilities = resolved.capabilities
+    if (!entry.limit) entry.limit = resolved.limit
+  }
+  return entry
 }
 
 const OPENAI_COMPATIBLE = "@opencode-ai/ai/providers/openai-compatible"
@@ -215,6 +405,7 @@ export function validBaseURL(value: string): boolean {
 
 export interface Discovery {
   ids?: string[]
+  raw?: Record<string, unknown>
   error?: string
 }
 
@@ -235,11 +426,13 @@ export async function discoverModels(baseURL: string, apiKey?: string): Promise<
       } catch {
         return { error: "bad-body" }
       }
-      const ids = ((data && (data as any).data) || [])
-        .map((m: any) => m && m.id)
-        .filter(Boolean)
-      const unique = [...new Set(ids as string[])]
-      return unique.length ? { ids: unique } : { error: "empty" }
+      const items = ((data && (data as any).data) || []).filter((m: any) => m && m.id)
+      const raw: Record<string, unknown> = {}
+      for (const m of items as any[]) {
+        if (raw[m.id] === undefined) raw[m.id] = m
+      }
+      const ids = Object.keys(raw)
+      return ids.length ? { ids, raw } : { error: "empty" }
     } finally {
       clearTimeout(timer)
     }
@@ -249,6 +442,13 @@ export async function discoverModels(baseURL: string, apiKey?: string): Promise<
 }
 
 function normalizeInput(raw: ProviderInput): ProviderInput {
+  const num = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.trunc(v) : undefined
+  const strArr = (v: unknown): string[] | undefined => {
+    if (!Array.isArray(v)) return undefined
+    const out = [...new Set(v.map((m) => trimString(m)).filter(Boolean))]
+    return out.length ? out : undefined
+  }
   return {
     ...raw,
     id: trimString(raw.id),
@@ -259,6 +459,23 @@ function normalizeInput(raw: ProviderInput): ProviderInput {
     modelUpstream: raw.modelUpstream ? trimString(raw.modelUpstream) : undefined,
     apiKeyEnv: raw.apiKeyEnv ? trimString(raw.apiKeyEnv) : undefined,
     apiKey: raw.apiKey ? trimString(raw.apiKey) : undefined,
+    contextLimit: num(raw.contextLimit),
+    outputLimit: num(raw.outputLimit),
+    inputLimit: num(raw.inputLimit),
+    tools: typeof raw.tools === "boolean" ? raw.tools : undefined,
+    inputModalities: strArr(raw.inputModalities),
+    outputModalities: strArr(raw.outputModalities),
+  }
+}
+
+export function providerInputMeta(args: ProviderInput): ModelMetaInput {
+  return {
+    contextLimit: args.contextLimit,
+    outputLimit: args.outputLimit,
+    inputLimit: args.inputLimit,
+    tools: args.tools,
+    inputModalities: args.inputModalities,
+    outputModalities: args.outputModalities,
   }
 }
 
@@ -288,9 +505,15 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
     )
   }
 
+  const previous = exists ? (config.providers[id] as ProviderEntry) : undefined
   const modelUpstream = args.modelUpstream ?? args.model
-  const modelEntry: ModelEntry = { name: args.modelName ?? args.model }
+  const prevModel = previous && previous.models ? previous.models[args.model] : undefined
+  const modelEntry: ModelEntry = {
+    name: args.modelName ?? prevModel?.name ?? args.model,
+    ...resolveModelMeta(undefined, providerInputMeta(args), prevModel),
+  }
   if (modelUpstream !== args.model) modelEntry.modelID = modelUpstream
+  else if (prevModel?.modelID) modelEntry.modelID = prevModel.modelID
 
   const wanted = [args.model]
   if (Array.isArray(args.extraModels)) {
@@ -300,7 +523,6 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
     }
   }
 
-  const previous = exists ? (config.providers[id] as ProviderEntry) : undefined
   const prevSettings =
     previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {}
   const settings: ProviderEntry["settings"] = { ...prevSettings, baseURL }
@@ -321,7 +543,9 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
   const mergedModels: Record<string, ModelEntry> = { ...((previous && previous.models) || {}) }
   mergedModels[args.model] = modelEntry
   for (const m of wanted) {
-    if (!mergedModels[m]) mergedModels[m] = { name: m }
+    const cur = mergedModels[m]
+    if (!cur) mergedModels[m] = { name: m, ...resolveModelMeta() }
+    else ensureModelMeta(cur)
   }
   config.providers[id] = {
     name: args.name ?? previous?.name ?? id,
@@ -376,7 +600,12 @@ export function removeProvider(rawID: string): string {
   return `Deleted: ${id} (config + stored key).`
 }
 
-export function editProviderModels(rawID: string, add?: string[], remove?: string[]): string {
+export function editProviderModels(
+  rawID: string,
+  add?: string[],
+  remove?: string[],
+  meta?: ModelMetaInput,
+): string {
   const id = trimString(rawID)
   if (!id) return "Error: empty ID."
   const file = globalConfigPath()
@@ -390,8 +619,17 @@ export function editProviderModels(rawID: string, add?: string[], remove?: strin
   if (!entry) return `Error: "${id}" not found.`
   const models: Record<string, ModelEntry> = { ...(entry.models || {}) }
   const norm = (v: unknown) => trimString(v)
+  const hasMeta = meta !== undefined && Object.values(meta).some((v) => v !== undefined)
   for (const m of (Array.isArray(add) ? add : []).map(norm).filter(Boolean)) {
-    if (!models[m]) models[m] = { name: m }
+    const cur = models[m]
+    if (!cur) {
+      models[m] = { name: m, ...resolveModelMeta(undefined, meta) }
+    } else if (hasMeta) {
+      // Explicit values win; everything else is preserved, gaps filled.
+      models[m] = { ...cur, ...resolveModelMeta(undefined, meta, cur) }
+    } else {
+      ensureModelMeta(cur)
+    }
   }
   for (const m of (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)) {
     delete models[m]
@@ -412,6 +650,7 @@ export interface ScanResult {
   ids?: string[]
   current?: string[]
   baseURL?: string
+  meta?: Record<string, DiscoveredMeta>
   error?: string
 }
 
@@ -451,7 +690,17 @@ export async function scanProviderModels(rawID: string): Promise<ScanResult> {
               : `Endpoint error (${found.error}).`
     return { error: reason, baseURL }
   }
-  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL }
+  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL, meta: discoveredMeta(found.raw) }
+}
+
+export function discoveredMeta(raw?: Record<string, unknown>): Record<string, DiscoveredMeta> {
+  const out: Record<string, DiscoveredMeta> = {}
+  if (!raw) return out
+  for (const [id, item] of Object.entries(raw)) {
+    const meta = extractModelMeta(item)
+    if (Object.keys(meta).length) out[id] = meta
+  }
+  return out
 }
 
 // model.request hook: injects the stored key as an Authorization header.

@@ -3,6 +3,146 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+var FALLBACK_LIMIT = { context: 200000, output: 32000 };
+var FALLBACK_CAPABILITIES = { tools: true, input: ["text", "image"], output: ["text"] };
+var CONTEXT_KEYS = [
+  "max_model_len",
+  "max_context_length",
+  "context_length",
+  "context_window",
+  "contextLength",
+  "max_context",
+  "n_ctx"
+];
+var OUTPUT_KEYS = ["max_output_tokens", "max_completion_tokens", "max_tokens", "max_new_tokens"];
+var INPUT_KEYS = ["max_input_tokens", "max_prompt_tokens"];
+var TOOLS_BOOL_KEYS = ["supports_tools", "function_calling"];
+var INPUT_MOD_KEYS = ["input_modalities", "inputModalities"];
+var OUTPUT_MOD_KEYS = ["output_modalities", "outputModalities"];
+function validLimit(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
+    return;
+  return Math.trunc(value);
+}
+function validModalities(value) {
+  if (!Array.isArray(value))
+    return;
+  const out = [...new Set(value.map((v) => typeof v === "string" ? v.trim().toLowerCase() : "").filter(Boolean))];
+  return out.length ? out : undefined;
+}
+function scrapeMetaBag(bag) {
+  const meta = {};
+  const pickNum = (keys) => {
+    for (const k of keys) {
+      const v = validLimit(bag[k]);
+      if (v !== undefined)
+        return v;
+    }
+    return;
+  };
+  const context = pickNum(CONTEXT_KEYS);
+  if (context !== undefined)
+    meta.context = context;
+  const output = pickNum(OUTPUT_KEYS);
+  if (output !== undefined)
+    meta.output = output;
+  const input = pickNum(INPUT_KEYS);
+  if (input !== undefined)
+    meta.input = input;
+  for (const k of TOOLS_BOOL_KEYS) {
+    if (typeof bag[k] === "boolean") {
+      meta.tools = bag[k];
+      break;
+    }
+  }
+  if (Array.isArray(bag.supported_parameters)) {
+    const params = bag.supported_parameters.map((p) => String(p).toLowerCase());
+    if (params.includes("tools") || params.includes("tool_choice"))
+      meta.tools = true;
+  }
+  for (const k of INPUT_MOD_KEYS) {
+    const mods = validModalities(bag[k]);
+    if (mods) {
+      meta.inputModalities = mods;
+      break;
+    }
+  }
+  for (const k of OUTPUT_MOD_KEYS) {
+    const mods = validModalities(bag[k]);
+    if (mods) {
+      meta.outputModalities = mods;
+      break;
+    }
+  }
+  if (!meta.inputModalities) {
+    const flat = validModalities(bag.modalities);
+    if (flat)
+      meta.inputModalities = flat;
+  }
+  if ((!meta.inputModalities || !meta.outputModalities) && typeof bag.modality === "string") {
+    const sides = bag.modality.split("->").map((s) => [...new Set(s.split("+").map((m) => m.trim().toLowerCase()).filter(Boolean))]);
+    if (sides[0]?.length && !meta.inputModalities)
+      meta.inputModalities = sides[0];
+    if (sides[1]?.length && !meta.outputModalities)
+      meta.outputModalities = sides[1];
+  }
+  if (bag.vision === true && meta.inputModalities && !meta.inputModalities.includes("image")) {
+    meta.inputModalities = [...meta.inputModalities, "image"];
+  } else if (bag.vision === true && !meta.inputModalities) {
+    meta.inputModalities = ["text", "image"];
+  }
+  return meta;
+}
+function extractModelMeta(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw))
+    return {};
+  const bag = raw;
+  const meta = scrapeMetaBag(bag);
+  for (const nestKey of ["meta", "architecture"]) {
+    const nested = bag[nestKey];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      const inner = scrapeMetaBag(nested);
+      for (const [k, v] of Object.entries(inner)) {
+        if (meta[k] === undefined)
+          meta[k] = v;
+      }
+    }
+  }
+  return meta;
+}
+function resolveModelMeta(raw, overrides, base) {
+  const found = raw === undefined ? {} : extractModelMeta(raw);
+  const o = overrides ?? {};
+  const num = (v) => validLimit(v);
+  const context = num(o.contextLimit) ?? base?.limit?.context ?? found.context ?? FALLBACK_LIMIT.context;
+  const output = num(o.outputLimit) ?? base?.limit?.output ?? found.output ?? FALLBACK_LIMIT.output;
+  const input = num(o.inputLimit) ?? base?.limit?.input ?? found.input;
+  const cleanArr = (v) => {
+    if (v === undefined)
+      return;
+    const mods = validModalities(v);
+    return mods;
+  };
+  const limit = input === undefined ? { context, output } : { context, input, output };
+  return {
+    capabilities: {
+      tools: typeof o.tools === "boolean" ? o.tools : base?.capabilities?.tools ?? found.tools ?? FALLBACK_CAPABILITIES.tools,
+      input: cleanArr(o.inputModalities) ?? base?.capabilities?.input ?? found.inputModalities ?? [...FALLBACK_CAPABILITIES.input],
+      output: cleanArr(o.outputModalities) ?? base?.capabilities?.output ?? found.outputModalities ?? [...FALLBACK_CAPABILITIES.output]
+    },
+    limit
+  };
+}
+function ensureModelMeta(entry, raw, overrides) {
+  if (!entry.capabilities || !entry.limit) {
+    const resolved = resolveModelMeta(raw, overrides, entry);
+    if (!entry.capabilities)
+      entry.capabilities = resolved.capabilities;
+    if (!entry.limit)
+      entry.limit = resolved.limit;
+  }
+  return entry;
+}
 var OPENAI_COMPATIBLE = "@opencode-ai/ai/providers/openai-compatible";
 function trimString(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -188,9 +328,14 @@ async function discoverModels(baseURL, apiKey) {
       } catch {
         return { error: "bad-body" };
       }
-      const ids = (data && data.data || []).map((m) => m && m.id).filter(Boolean);
-      const unique = [...new Set(ids)];
-      return unique.length ? { ids: unique } : { error: "empty" };
+      const items = (data && data.data || []).filter((m) => m && m.id);
+      const raw = {};
+      for (const m of items) {
+        if (raw[m.id] === undefined)
+          raw[m.id] = m;
+      }
+      const ids = Object.keys(raw);
+      return ids.length ? { ids, raw } : { error: "empty" };
     } finally {
       clearTimeout(timer);
     }
@@ -199,6 +344,13 @@ async function discoverModels(baseURL, apiKey) {
   }
 }
 function normalizeInput(raw) {
+  const num = (v) => typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.trunc(v) : undefined;
+  const strArr = (v) => {
+    if (!Array.isArray(v))
+      return;
+    const out = [...new Set(v.map((m) => trimString(m)).filter(Boolean))];
+    return out.length ? out : undefined;
+  };
   return {
     ...raw,
     id: trimString(raw.id),
@@ -208,7 +360,23 @@ function normalizeInput(raw) {
     modelName: raw.modelName ? trimString(raw.modelName) : undefined,
     modelUpstream: raw.modelUpstream ? trimString(raw.modelUpstream) : undefined,
     apiKeyEnv: raw.apiKeyEnv ? trimString(raw.apiKeyEnv) : undefined,
-    apiKey: raw.apiKey ? trimString(raw.apiKey) : undefined
+    apiKey: raw.apiKey ? trimString(raw.apiKey) : undefined,
+    contextLimit: num(raw.contextLimit),
+    outputLimit: num(raw.outputLimit),
+    inputLimit: num(raw.inputLimit),
+    tools: typeof raw.tools === "boolean" ? raw.tools : undefined,
+    inputModalities: strArr(raw.inputModalities),
+    outputModalities: strArr(raw.outputModalities)
+  };
+}
+function providerInputMeta(args) {
+  return {
+    contextLimit: args.contextLimit,
+    outputLimit: args.outputLimit,
+    inputLimit: args.inputLimit,
+    tools: args.tools,
+    inputModalities: args.inputModalities,
+    outputModalities: args.outputModalities
   };
 }
 function upsertCustomProvider(rawArgs) {
@@ -235,10 +403,17 @@ function upsertCustomProvider(rawArgs) {
     return `"${id}" already exists. Repeat with overwrite:true to update.
 ` + `Current: ${JSON.stringify(config.providers[id]).slice(0, 300)}`;
   }
+  const previous = exists ? config.providers[id] : undefined;
   const modelUpstream = args.modelUpstream ?? args.model;
-  const modelEntry = { name: args.modelName ?? args.model };
+  const prevModel = previous && previous.models ? previous.models[args.model] : undefined;
+  const modelEntry = {
+    name: args.modelName ?? prevModel?.name ?? args.model,
+    ...resolveModelMeta(undefined, providerInputMeta(args), prevModel)
+  };
   if (modelUpstream !== args.model)
     modelEntry.modelID = modelUpstream;
+  else if (prevModel?.modelID)
+    modelEntry.modelID = prevModel.modelID;
   const wanted = [args.model];
   if (Array.isArray(args.extraModels)) {
     for (const m of args.extraModels) {
@@ -247,7 +422,6 @@ function upsertCustomProvider(rawArgs) {
         wanted.push(t);
     }
   }
-  const previous = exists ? config.providers[id] : undefined;
   const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {};
   const settings = { ...prevSettings, baseURL };
   let staleKeyRemoved = false;
@@ -264,8 +438,11 @@ function upsertCustomProvider(rawArgs) {
   const mergedModels = { ...previous && previous.models || {} };
   mergedModels[args.model] = modelEntry;
   for (const m of wanted) {
-    if (!mergedModels[m])
-      mergedModels[m] = { name: m };
+    const cur = mergedModels[m];
+    if (!cur)
+      mergedModels[m] = { name: m, ...resolveModelMeta() };
+    else
+      ensureModelMeta(cur);
   }
   config.providers[id] = {
     name: args.name ?? previous?.name ?? id,
@@ -320,7 +497,7 @@ function removeProvider(rawID) {
   deleteKeyFileEntry(id);
   return `Deleted: ${id} (config + stored key).`;
 }
-function editProviderModels(rawID, add, remove) {
+function editProviderModels(rawID, add, remove, meta) {
   const id = trimString(rawID);
   if (!id)
     return "Error: empty ID.";
@@ -336,9 +513,16 @@ function editProviderModels(rawID, add, remove) {
     return `Error: "${id}" not found.`;
   const models = { ...entry.models || {} };
   const norm = (v) => trimString(v);
+  const hasMeta = meta !== undefined && Object.values(meta).some((v) => v !== undefined);
   for (const m of (Array.isArray(add) ? add : []).map(norm).filter(Boolean)) {
-    if (!models[m])
-      models[m] = { name: m };
+    const cur = models[m];
+    if (!cur) {
+      models[m] = { name: m, ...resolveModelMeta(undefined, meta) };
+    } else if (hasMeta) {
+      models[m] = { ...cur, ...resolveModelMeta(undefined, meta, cur) };
+    } else {
+      ensureModelMeta(cur);
+    }
   }
   for (const m of (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)) {
     delete models[m];
@@ -384,7 +568,18 @@ async function scanProviderModels(rawID) {
     const reason = found.error === "auth" ? "Endpoint requires a key (401)." : found.error === "empty" ? "Endpoint returned an empty list." : found.error === "bad-body" ? "Endpoint answered 200 but not with OpenAI-style JSON." : found.error === "network" ? "Endpoint unreachable." : `Endpoint error (${found.error}).`;
     return { error: reason, baseURL };
   }
-  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL };
+  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL, meta: discoveredMeta(found.raw) };
+}
+function discoveredMeta(raw) {
+  const out = {};
+  if (!raw)
+    return out;
+  for (const [id, item] of Object.entries(raw)) {
+    const meta = extractModelMeta(item);
+    if (Object.keys(meta).length)
+      out[id] = meta;
+  }
+  return out;
 }
 async function injectAuth(event) {
   const providerID = event && event.model && event.model.providerID;
@@ -404,7 +599,7 @@ var opencode_custom_provider_default = {
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "custom_provider_add",
-        description: "Add or update a custom OpenAI-compatible provider in the global opencode.jsonc. " + "Ask the user for id, baseURL and model when missing. Never invent URLs or keys. " + "Prefer apiKey (raw key, stored separately) over apiKeyEnv; never write raw secrets into config.",
+        description: "Add or update a custom OpenAI-compatible provider in the global opencode.jsonc. " + "Ask the user for id, baseURL and model when missing. Never invent URLs or keys. " + "Prefer apiKey (raw key, stored separately) over apiKeyEnv; never write raw secrets into config. " + "Each model is written with explicit limit/capabilities. Run custom_provider_scan first and pass " + "discovered values (contextLimit/outputLimit/inputLimit/tools/modalities); anything omitted falls " + "back to OpenCode defaults (200000 context, 32000 output, tools with text+image in, text out).",
         input: {
           type: "object",
           properties: {
@@ -417,7 +612,13 @@ var opencode_custom_provider_default = {
             extraModels: { type: "array", items: { type: "string" }, description: "Extra model IDs for the same provider." },
             apiKeyEnv: { type: "string", description: "ENV var holding the key. Ignored when apiKey is given." },
             apiKey: { type: "string", description: "Raw API key. Stored separately, injected per request. Ask the user, never invent." },
-            overwrite: { type: "boolean", description: "Overwrite an existing ID." }
+            overwrite: { type: "boolean", description: "Overwrite an existing ID." },
+            contextLimit: { type: "number", description: "Context window tokens for `model`." },
+            outputLimit: { type: "number", description: "Max output tokens for `model`." },
+            inputLimit: { type: "number", description: "Max input tokens for `model`. Omit when unknown." },
+            tools: { type: "boolean", description: "Whether `model` supports tool calling." },
+            inputModalities: { type: "array", items: { type: "string" }, description: 'Input modalities for `model`, e.g. ["text","image"].' },
+            outputModalities: { type: "array", items: { type: "string" }, description: 'Output modalities for `model`, e.g. ["text"].' }
           },
           required: ["id", "baseURL", "model"],
           additionalProperties: false
@@ -444,7 +645,7 @@ var opencode_custom_provider_default = {
       });
       editor.add({
         name: "custom_provider_scan",
-        description: "Rescan an existing custom provider's endpoint (/models) and list discovered vs configured models. " + "Use before adding new models. Never invent results, report errors as-is.",
+        description: "Rescan an existing custom provider's endpoint (/models) and list discovered vs configured models, " + "including any discovered per-model limits/capabilities. " + "Use before adding new models. Never invent results, report errors as-is.",
         input: {
           type: "object",
           properties: {
@@ -460,11 +661,23 @@ var opencode_custom_provider_default = {
             return { content: `Scan failed (${id}): ${r.error}` };
           const fresh = (r.ids ?? []).filter((m) => !(r.current ?? []).includes(m));
           const gone = (r.current ?? []).filter((m) => !(r.ids ?? []).includes(m));
+          const metaLines = Object.entries(r.meta ?? {}).map(([m, mt]) => {
+            const bits = [
+              mt.context !== undefined ? `context=${mt.context}` : "",
+              mt.output !== undefined ? `output=${mt.output}` : "",
+              mt.input !== undefined ? `input=${mt.input}` : "",
+              mt.tools !== undefined ? `tools=${mt.tools}` : "",
+              mt.inputModalities ? `in=[${mt.inputModalities.join(",")}]` : "",
+              mt.outputModalities ? `out=[${mt.outputModalities.join(",")}]` : ""
+            ].filter(Boolean).join(" ");
+            return `${m} (${bits})`;
+          });
           const lines = [
             `Endpoint: ${r.baseURL}`,
             `Discovered: ${(r.ids ?? []).length} model(s)`,
             fresh.length ? `New (addable): ${fresh.join(", ").slice(0, 500)}` : "No new models.",
-            gone.length ? `Missing upstream (removable): ${gone.join(", ").slice(0, 300)}` : ""
+            gone.length ? `Missing upstream (removable): ${gone.join(", ").slice(0, 300)}` : "",
+            metaLines.length ? `Discovered limits: ${metaLines.join("; ").slice(0, 500)}` : ""
           ].filter(Boolean);
           return { content: lines.join(`
 `) };
@@ -472,20 +685,26 @@ var opencode_custom_provider_default = {
       });
       editor.add({
         name: "custom_provider_edit_models",
-        description: "Add and/or remove models of an existing custom provider. At least 1 model must remain. " + "Confirm the model list with the user before calling.",
+        description: "Add and/or remove models of an existing custom provider. At least 1 model must remain. " + "Added models are written with explicit limit/capabilities: pass discovered values from " + "custom_provider_scan (or ask the user); anything omitted falls back to OpenCode defaults " + "(200000 context, 32000 output, tools with text+image in, text out). " + "Confirm the model list with the user before calling.",
         input: {
           type: "object",
           properties: {
             id: { type: "string", description: "Provider ID, e.g. acme" },
             add: { type: "array", items: { type: "string" }, description: "Model IDs to add." },
-            remove: { type: "array", items: { type: "string" }, description: "Model IDs to remove." }
+            remove: { type: "array", items: { type: "string" }, description: "Model IDs to remove." },
+            contextLimit: { type: "number", description: "Context window tokens, applied to added models." },
+            outputLimit: { type: "number", description: "Max output tokens, applied to added models." },
+            inputLimit: { type: "number", description: "Max input tokens, applied to added models. Omit when unknown." },
+            tools: { type: "boolean", description: "Tool-calling support, applied to added models." },
+            inputModalities: { type: "array", items: { type: "string" }, description: "Input modalities, applied to added models." },
+            outputModalities: { type: "array", items: { type: "string" }, description: "Output modalities, applied to added models." }
           },
           required: ["id"],
           additionalProperties: false
         },
         execute: async (input) => {
           const id = typeof input.id === "string" ? input.id.trim() : "";
-          return { content: editProviderModels(id, input.add, input.remove) };
+          return { content: editProviderModels(id, input.add, input.remove, providerInputMeta(input)) };
         }
       });
     });
