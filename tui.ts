@@ -242,6 +242,17 @@ function truncateReport(lines: string[], max = 5): string[] {
   return [...lines.slice(0, max), `... +${lines.length - max} more (see opencode.jsonc)`]
 }
 
+// Whether any question would fire for this model at all.
+function needsMetaQuestions(found: ReturnType<typeof extractModelMeta>): boolean {
+  return (
+    found.context === undefined ||
+    found.output === undefined ||
+    found.tools === undefined ||
+    found.inputModalities === undefined ||
+    found.outputModalities === undefined
+  )
+}
+
 // Prompt overrides for the pieces `found` doesn't cover. Returns undefined on cancel.
 async function promptMetaOverrides(
   ctx: Context,
@@ -304,28 +315,45 @@ async function resolveModelsMetaUI(
     if (skip.has(id)) out[id] = resolveModelMeta(raw[id])
   }
   if (!pending.length) return out
-  if (pending.length === 1) {
-    const id = pending[0]
+  const asking = pending.filter((id) => needsMetaQuestions(extractModelMeta(raw[id])))
+  for (const id of pending) {
+    if (!asking.includes(id)) out[id] = resolveModelMeta(raw[id])
+  }
+  if (!asking.length) return out
+  if (asking.length === 1) {
+    const id = asking[0]
+    const how = await dialog.select({
+      title: `Limits — ${id}`,
+      options: [
+        { title: "Answer questions", value: "ask" },
+        { title: "Skip all — use discovered/defaults", value: "skip" },
+      ],
+    })
+    if (!how) return undefined
+    if (how === "skip") {
+      out[id] = resolveModelMeta(raw[id])
+      return out
+    }
     const overrides = await promptMetaOverrides(ctx, id, extractModelMeta(raw[id]))
     if (!overrides) return undefined
     out[id] = resolveModelMeta(raw[id], overrides)
     return out
   }
   const mode = await dialog.select({
-    title: `Limits for ${pending.length} models (provider reports IDs only)`,
+    title: `Limits for ${asking.length} models (provider reports IDs only)`,
     options: [
       { title: "Same for all — ask once", value: "once" },
       { title: "Per model", value: "per" },
-      { title: "OpenCode defaults for all — don't ask", value: "defaults" },
+      { title: "Skip all — don't ask (discovered/defaults)", value: "defaults" },
     ],
   })
   if (!mode) return undefined
   if (mode === "defaults") {
-    for (const id of pending) out[id] = resolveModelMeta(raw[id])
+    for (const id of asking) out[id] = resolveModelMeta(raw[id])
     return out
   }
   if (mode === "per") {
-    for (const id of pending) {
+    for (const id of asking) {
       const overrides = await promptMetaOverrides(ctx, id, extractModelMeta(raw[id]))
       if (!overrides) return undefined
       out[id] = resolveModelMeta(raw[id], overrides)
@@ -334,7 +362,7 @@ async function resolveModelsMetaUI(
   }
   // "once": fields with a unanimous discovered value are used silently,
   // the rest is asked a single time and applied to every model.
-  const founds = pending.map((id) => extractModelMeta(raw[id]))
+  const founds = asking.map((id) => extractModelMeta(raw[id]))
   const unanimous = <T>(pick: (f: ReturnType<typeof extractModelMeta>) => T | undefined): T | undefined => {
     const first = pick(founds[0])
     if (first === undefined) return undefined
@@ -348,7 +376,7 @@ async function resolveModelsMetaUI(
   const needOut = unanimous((f) => f.outputModalities) === undefined
   if (needContext) {
     const v = await dialog.prompt({
-      title: `Context limit — all ${pending.length} models`,
+      title: `Context limit — all ${asking.length} models`,
       description: `Total context window tokens (empty = ${FALLBACK_LIMIT.context}).`,
       placeholder: String(FALLBACK_LIMIT.context),
     })
@@ -357,7 +385,7 @@ async function resolveModelsMetaUI(
   }
   if (needOutput) {
     const v = await dialog.prompt({
-      title: `Output limit — all ${pending.length} models`,
+      title: `Output limit — all ${asking.length} models`,
       description: `Max output tokens (empty = ${FALLBACK_LIMIT.output}).`,
       placeholder: String(FALLBACK_LIMIT.output),
     })
@@ -365,21 +393,21 @@ async function resolveModelsMetaUI(
     shared.outputLimit = parseLimitPrompt(v, FALLBACK_LIMIT.output)
   }
   if (needTools) {
-    const t = await promptTools(ctx, `all ${pending.length} models`)
+    const t = await promptTools(ctx, `all ${asking.length} models`)
     if (!t) return undefined
     if (!t.skipped) shared.tools = t.tools
   }
   if (needIn) {
-    const mods = await promptModalities(ctx, "Input", `all ${pending.length} models`)
+    const mods = await promptModalities(ctx, "Input", `all ${asking.length} models`)
     if (!mods) return undefined
     if (!mods.skipped) shared.inputModalities = mods.mods
   }
   if (needOut) {
-    const mods = await promptModalities(ctx, "Output", `all ${pending.length} models`)
+    const mods = await promptModalities(ctx, "Output", `all ${asking.length} models`)
     if (!mods) return undefined
     if (!mods.skipped) shared.outputModalities = mods.mods
   }
-  for (const id of pending) out[id] = resolveModelMeta(raw[id], shared)
+  for (const id of asking) out[id] = resolveModelMeta(raw[id], shared)
   return out
 }
 
