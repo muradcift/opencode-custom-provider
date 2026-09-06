@@ -240,6 +240,20 @@ export function resolveModelMeta(
   }
 }
 
+// True when at least one limit field came from the provider (discovered) or
+// was given explicitly — i.e. the entry is not pure OpenCode fallback.
+export function hasDiscoveredLimits(sources?: MetaSources): boolean {
+  if (!sources) return true
+  return (
+    sources.context === "discovered" ||
+    sources.context === "explicit" ||
+    sources.input === "discovered" ||
+    sources.input === "explicit" ||
+    sources.output === "discovered" ||
+    sources.output === "explicit"
+  )
+}
+
 // One-line per-model report, e.g.
 // `- acme/coder: context 128000, output 16384`
 // `- acme/chat: context 200000 (default), output 32000 (default)`

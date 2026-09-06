@@ -8,6 +8,7 @@ import {
   FALLBACK_LIMIT,
   formatMetaReport,
   globalConfigPath,
+  hasDiscoveredLimits,
   listCustomProviders,
   loadConfig,
   readKeys,
@@ -488,8 +489,11 @@ async function writeProvider(
     return
   }
   await syncCatalog(ctx)
-  const report = models.map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
-  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.\n${truncateReport(report).join("\n")}`, "success")
+  const report = models
+    .filter((m) => hasDiscoveredLimits(reportSources[m]))
+    .map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
+  const suffix = report.length ? `\n${truncateReport(report).join("\n")}` : ""
+  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.${suffix}`, "success")
 }
 
 async function editModelsFlow(ctx: Context) {
@@ -594,14 +598,17 @@ async function editModelsFlow(ctx: Context) {
       }
     }
     target.models = models
-    report = [...current].map((m) => formatMetaReport(`${pid}/${m}`, models[m], reportSources[m]))
+    report = [...current]
+      .filter((m) => hasDiscoveredLimits(reportSources[m]))
+      .map((m) => formatMetaReport(`${pid}/${m}`, models[m], reportSources[m]))
     saveConfig(file, config)
   } catch (e) {
     await dialog.alert({ title: "Cannot write", message: (e as Error).message })
     return
   }
   await syncCatalog(ctx)
-  toast(ctx, `Saved: ${pid} (${current.size} model(s)).\n${truncateReport(report).join("\n")}`, "success")
+  const suffix = report.length ? `\n${truncateReport(report).join("\n")}` : ""
+  toast(ctx, `Saved: ${pid} (${current.size} model(s)).${suffix}`, "success")
 }
 
 async function deleteFlow(ctx: Context) {
