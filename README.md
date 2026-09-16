@@ -5,7 +5,7 @@ Add, edit and delete custom OpenAI-compatible providers in OpenCode, from the co
 ## Install
 
 ```sh
-opencode2 plugin add github:muradcift/opencode-custom-provider
+opencode plugin add github:muradcift/opencode-custom-provider
 ```
 
 Or reference a local checkout in `opencode.jsonc`:
@@ -30,7 +30,7 @@ Notes:
 
 - Every save rewrites `opencode.jsonc` as plain JSON, so your comments there are lost. A timestamped backup (`opencode.jsonc.bak-*`) is written next to it first.
 - The TUI Add flow only takes a raw key (or empty); for `{env:VAR}`-based auth use the `custom_provider_add` tool with `apiKeyEnv`.
-- After upstream fixes, refresh a git-installed copy with `opencode2 plugin update github:muradcift/opencode-custom-provider`.
+- After upstream fixes, refresh a git-installed copy with `opencode plugin update github:muradcift/opencode-custom-provider`.
 - Each model is stored with explicit `limit` (context/output, input when known) and `capabilities` (tools, input/output modalities). Values are scraped from `/models` extras when the server provides them (e.g. `max_model_len`, `context_length`); anything missing is asked in the TUI or falls back to OpenCode defaults (200000 context, 32000 output), written out explicitly.
 
 ## Local development
@@ -41,7 +41,7 @@ The plugin must be discoverable under `<config>/plugins/`. Point a junction at t
 cmd /c mklink /J "%USERPROFILE%\.config\opencode\plugins\custom-provider" "D:\path\to\opencode-custom-provider"
 ```
 
-Then restart the service once: `opencode2 service restart`.
+Then restart the service once: `opencode service restart`.
 
 Dev tooling (`tsc`, types) is intentionally not a dependency so installs stay lean; add it locally when needed:
 
