@@ -12,6 +12,7 @@ import {
   listCustomProviders,
   loadConfig,
   readKeys,
+  readConfigText,
   resolveModelMeta,
   saveConfig,
   validBaseURL,
@@ -430,6 +431,7 @@ async function writeProvider(
 ) {
   const dialog = ctx.ui.dialog
   const file = globalConfigPath()
+  const before = readConfigText(file)
   let config: Record<string, any>
   try {
     config = loadConfig(file)
@@ -483,7 +485,7 @@ async function writeProvider(
   if (!config.$schema) config.$schema = "https://opencode.ai/config.json"
 
   try {
-    saveConfig(file, config)
+    saveConfig(file, config, before)
   } catch (e) {
     await dialog.alert({ title: "Cannot write", message: `${file}: ${(e as Error).message}` })
     return
@@ -579,6 +581,7 @@ async function editModelsFlow(ctx: Context) {
   let report: string[] = []
   try {
     const file = globalConfigPath()
+    const before = readConfigText(file)
     const config = loadConfig(file)
     const target = config.providers[pid]
     const original = new Set(Object.keys((target.models as Record<string, ModelEntry>) || {}))
@@ -601,7 +604,7 @@ async function editModelsFlow(ctx: Context) {
     report = [...current]
       .filter((m) => hasDiscoveredLimits(reportSources[m]))
       .map((m) => formatMetaReport(`${pid}/${m}`, models[m], reportSources[m]))
-    saveConfig(file, config)
+    saveConfig(file, config, before)
   } catch (e) {
     await dialog.alert({ title: "Cannot write", message: (e as Error).message })
     return
@@ -631,10 +634,11 @@ async function deleteFlow(ctx: Context) {
   if (!okGo) return
   try {
     const file = globalConfigPath()
+    const before = readConfigText(file)
     const config = loadConfig(file)
     delete config.providers[picked]
     if (Object.keys(config.providers).length === 0) delete config.providers
-    saveConfig(file, config)
+    saveConfig(file, config, before)
     deleteKeyFileEntry(picked)
   } catch (e) {
     await dialog.alert({ title: "Cannot delete", message: (e as Error).message })

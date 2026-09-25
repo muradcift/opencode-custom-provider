@@ -430,7 +430,28 @@ export function loadConfig(file: string): Record<string, any> {
   }
 }
 
-export function saveConfig(file: string, config: Record<string, any>): void {
+// Exact bytes of the config as they are on disk, or null when there is no file.
+// Pair it with loadConfig() and hand it back to saveConfig(): a write that raced
+// another writer (another session, `opencode plugin add`, a human editing the
+// file) is then refused instead of silently dropping that writer's keys — which is
+// how a whole providers block used to disappear without any error.
+export function readConfigText(file: string): string | null {
+  try {
+    return fs.readFileSync(file, "utf8")
+  } catch {
+    return null
+  }
+}
+
+export function saveConfig(file: string, config: Record<string, any>, expectedText?: string | null): void {
+  if (expectedText !== undefined) {
+    const current = readConfigText(file)
+    if (current !== expectedText) {
+      throw new Error(
+        `${file} changed on disk while this command was running. Nothing was written — run it again so your change lands on top of the current file.`,
+      )
+    }
+  }
   if (fs.existsSync(file)) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-")
     fs.copyFileSync(file, `${file}.bak-${stamp}`)
@@ -546,6 +567,7 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
   if (!validBaseURL(baseURL)) return `Error: invalid baseURL "${baseURL}". Expected https://example.com/v1.`
 
   const file = globalConfigPath()
+  const before = readConfigText(file)
   let config: Record<string, any>
   try {
     config = loadConfig(file)
@@ -625,7 +647,7 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
   if (!config.$schema) config.$schema = "https://opencode.ai/config.json"
 
   try {
-    saveConfig(file, config)
+    saveConfig(file, config, before)
   } catch (e) {
     return `Error: cannot write config (${file}): ${(e as Error).message}`
   }
@@ -651,6 +673,7 @@ export function removeProvider(rawID: string): string {
   const id = trimString(rawID)
   if (!id) return "Error: empty ID."
   const file = globalConfigPath()
+  const before = readConfigText(file)
   let config: Record<string, any>
   try {
     config = loadConfig(file)
@@ -663,7 +686,7 @@ export function removeProvider(rawID: string): string {
   delete config.providers[id]
   if (Object.keys(config.providers).length === 0) delete config.providers
   try {
-    saveConfig(file, config)
+    saveConfig(file, config, before)
   } catch (e) {
     return `Error: cannot write config (${file}): ${(e as Error).message}`
   }
@@ -680,6 +703,7 @@ export function editProviderModels(
   const id = trimString(rawID)
   if (!id) return "Error: empty ID."
   const file = globalConfigPath()
+  const before = readConfigText(file)
   let config: Record<string, any>
   try {
     config = loadConfig(file)
@@ -716,7 +740,7 @@ export function editProviderModels(
   }
   entry.models = models
   try {
-    saveConfig(file, config)
+    saveConfig(file, config, before)
   } catch (e) {
     return `Error: cannot write config (${file}): ${(e as Error).message}`
   }

@@ -29,9 +29,17 @@ Keys are kept in `.custom-provider-keys.json` (`0600`) and injected per request.
 Notes:
 
 - Every save rewrites `opencode.jsonc` as plain JSON, so your comments there are lost. A timestamped backup (`opencode.jsonc.bak-*`) is written next to it first.
+- Every save also refuses to write when the config changed on disk since it was read (another session, `opencode plugin add`, a hand edit). Without that check a read-modify-write silently dropped whatever the other writer had added — including the whole `providers` block. Re-run the command and it applies on top of the current file.
 - The TUI Add flow only takes a raw key (or empty); for `{env:VAR}`-based auth use the `custom_provider_add` tool with `apiKeyEnv`.
 - After upstream fixes, refresh a git-installed copy with `opencode plugin update github:muradcift/opencode-custom-provider`.
 - Each model is stored with explicit `limit` (context/output, input when known) and `capabilities` (tools, input/output modalities). Values are scraped from `/models` extras when the server provides them (e.g. `max_model_len`, `context_length`); anything missing is asked in the TUI or falls back to OpenCode defaults (200000 context, 32000 output), written out explicitly.
+
+## Local setup backup
+
+`local/opencode.global.json` is a copy of the global `~/.config/opencode/opencode.json` this repo was last used
+with: the plugin entry plus the `providers.opencode.models` block that hides OpenCode Zen's paid models and re-enables
+`mimo-v2.5-free` (models.dev marks it deprecated while Zen still serves it free). It holds no secrets — keys live in
+`.custom-provider-keys.json`. Copy it over the global config to get back to a known-good state in one step.
 
 ## Local development
 

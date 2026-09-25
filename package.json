@@ -19,6 +19,7 @@
   ],
   "scripts": {
     "bundle": "bun build index.ts --outdir dist --target bun --format esm",
+    "test": "bun run test/guard.test.ts",
     "typecheck": "tsc --noEmit"
   }
 }

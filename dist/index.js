@@ -320,7 +320,20 @@ function loadConfig(file) {
     return JSON.parse(stripTrailingCommas(stripJsonComments(raw)));
   }
 }
-function saveConfig(file, config) {
+function readConfigText(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+function saveConfig(file, config, expectedText) {
+  if (expectedText !== undefined) {
+    const current = readConfigText(file);
+    if (current !== expectedText) {
+      throw new Error(`${file} changed on disk while this command was running. Nothing was written \u2014 run it again so your change lands on top of the current file.`);
+    }
+  }
   if (fs.existsSync(file)) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     fs.copyFileSync(file, `${file}.bak-${stamp}`);
@@ -418,6 +431,7 @@ function upsertCustomProvider(rawArgs) {
   if (!validBaseURL(baseURL))
     return `Error: invalid baseURL "${baseURL}". Expected https://example.com/v1.`;
   const file = globalConfigPath();
+  const before = readConfigText(file);
   let config;
   try {
     config = loadConfig(file);
@@ -492,7 +506,7 @@ function upsertCustomProvider(rawArgs) {
   if (!config.$schema)
     config.$schema = "https://opencode.ai/config.json";
   try {
-    saveConfig(file, config);
+    saveConfig(file, config, before);
   } catch (e) {
     return `Error: cannot write config (${file}): ${e.message}`;
   }
@@ -518,6 +532,7 @@ function removeProvider(rawID) {
   if (!id)
     return "Error: empty ID.";
   const file = globalConfigPath();
+  const before = readConfigText(file);
   let config;
   try {
     config = loadConfig(file);
@@ -531,7 +546,7 @@ function removeProvider(rawID) {
   if (Object.keys(config.providers).length === 0)
     delete config.providers;
   try {
-    saveConfig(file, config);
+    saveConfig(file, config, before);
   } catch (e) {
     return `Error: cannot write config (${file}): ${e.message}`;
   }
@@ -543,6 +558,7 @@ function editProviderModels(rawID, add, remove, meta) {
   if (!id)
     return "Error: empty ID.";
   const file = globalConfigPath();
+  const before = readConfigText(file);
   let config;
   try {
     config = loadConfig(file);
@@ -580,7 +596,7 @@ function editProviderModels(rawID, add, remove, meta) {
   }
   entry.models = models;
   try {
-    saveConfig(file, config);
+    saveConfig(file, config, before);
   } catch (e) {
     return `Error: cannot write config (${file}): ${e.message}`;
   }

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    "github:muradcift/opencode-custom-provider"
+  ],
+  "providers": {
+    "opencode": {
+      "models": {
+        "mimo-v2.5-free": { "name": "MiMo-V2.5 Free", "disabled": false },
+        "claude-opus-5-5": { "disabled": true },
+        "gpt-6-luna": { "disabled": true },
+        "gpt-6-sol": { "disabled": true },
+        "gpt-6-astra": { "disabled": true },
+        "gpt-5.6-terra": { "disabled": true },
+        "gpt-5.5": { "disabled": true },
+        "gpt-5.5-pro": { "disabled": true },
+        "gpt-5.4-nano": { "disabled": true },
+        "gpt-5.4-mini": { "disabled": true },
+        "gpt-5.3-codex": { "disabled": true },
+        "gpt-5.3-codex-spark": { "disabled": true },
+        "claude-sonnet-5": { "disabled": true },
+        "claude-fable-5-1": { "disabled": true },
+        "claude-haiku-4-5": { "disabled": true },
+        "gemini-3.8-flash": { "disabled": true },
+        "gemini-3.5-flash-lite": { "disabled": true },
+        "gemini-3.1-pro": { "disabled": true },
+        "grok-4.7": { "disabled": true },
+        "grok-build-0.1": { "disabled": true },
+        "qwen3.8-max": { "disabled": true },
+        "qwen3.8-flash": { "disabled": true },
+        "qwen3.6-plus": { "disabled": true },
+        "deepseek-v4.1-flash": { "disabled": true },
+        "deepseek-v4-pro": { "disabled": true },
+        "minimax-m3": { "disabled": true },
+        "glm-5.3": { "disabled": true },
+        "glm-5.3-flash": { "disabled": true },
+        "kimi-k3": { "disabled": true },
+        "kimi-k2.7-code": { "disabled": true },
+        "muse-spark-1.3": { "disabled": true }
+      }
+    }
+  }
+}
