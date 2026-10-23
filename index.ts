@@ -1,5 +1,13 @@
 import type { Plugin } from "@opencode-ai/plugin"
-import { editProviderModels, injectAuth, providerInputMeta, removeProvider, scanProviderModels, upsertCustomProvider } from "./src/shared.js"
+import {
+  editProviderModels,
+  injectAuth,
+  providerInputMeta,
+  removeProvider,
+  scanNewModels,
+  scanProviderModels,
+  upsertCustomProvider,
+} from "./src/shared.js"
 
 export default {
   id: "custom-provider",
@@ -13,7 +21,11 @@ export default {
           "Prefer apiKey (raw key, stored separately) over apiKeyEnv; never write raw secrets into config. " +
           "Each model is written with explicit limit/capabilities. Run custom_provider_scan first and pass " +
           "discovered values (contextLimit/outputLimit/inputLimit/tools/modalities); anything omitted falls " +
-          "back to OpenCode defaults (200000 context, 32000 output, tools with text+image in, text out).",
+          "back to OpenCode defaults (200000 context, 32000 output, tools with text+image in, text out). " +
+          "OpenCode treats providers.<id>.models as an overlay on its built-in models.dev catalog, not as a " +
+          "whitelist: when the ID matches a catalog provider, unselected catalog models are written as " +
+          "disabled: true so only the selected models appear. Prefer a unique provider ID when you want a " +
+          "clean config without disabled stubs.",
         input: {
           type: "object",
           properties: {
@@ -38,7 +50,7 @@ export default {
           additionalProperties: false,
         },
         execute: async (input: unknown) => {
-          return { content: upsertCustomProvider(input as any) }
+          return { content: await upsertCustomProvider(input as any) }
         },
       })
       editor.add({
@@ -77,7 +89,7 @@ export default {
           const id = typeof input.id === "string" ? input.id.trim() : ""
           const r = await scanProviderModels(id)
           if (r.error) return { content: `Scan failed (${id}): ${r.error}` }
-          const fresh = (r.ids ?? []).filter((m) => !(r.current ?? []).includes(m))
+          const fresh = scanNewModels(r.ids ?? [], r.current ?? [], r.hiddenIDs ?? [])
           const gone = (r.current ?? []).filter((m) => !(r.ids ?? []).includes(m))
           const metaLines = Object.entries(r.meta ?? {}).map(([m, mt]) => {
             const bits = [
@@ -97,6 +109,7 @@ export default {
             `Discovered: ${(r.ids ?? []).length} model(s)`,
             fresh.length ? `New (addable): ${fresh.join(", ").slice(0, 500)}` : "No new models.",
             gone.length ? `Missing upstream (removable): ${gone.join(", ").slice(0, 300)}` : "",
+            r.hidden ? `Hidden (disabled): ${r.hidden} built-in catalog model(s), not shown in /models.` : "",
             metaLines.length ? `Discovered limits: ${metaLines.join("; ").slice(0, 500)}` : "",
           ].filter(Boolean)
           return { content: lines.join("\n") }
@@ -105,10 +118,14 @@ export default {
       editor.add({
         name: "custom_provider_edit_models",
         description:
-          "Add and/or remove models of an existing custom provider. At least 1 model must remain. " +
+          "Add and/or remove models of an existing custom provider. At least 1 model must remain enabled. " +
           "Added models are written with explicit limit/capabilities: pass discovered values from " +
           "custom_provider_scan (or ask the user); anything omitted falls back to OpenCode defaults " +
           "(200000 context, 32000 output, tools with text+image in, text out). " +
+          "OpenCode treats providers.<id>.models as an overlay on its built-in models.dev catalog, not as a " +
+          "whitelist: for a colliding provider ID, unselected catalog models are kept as disabled: true " +
+          "stubs (removing one does not delete it) and newly colliding IDs get added as disabled stubs. " +
+          "Prefer a unique provider ID when you want a clean config. " +
           "Confirm the model list with the user before calling.",
         input: {
           type: "object",
@@ -128,7 +145,7 @@ export default {
         },
         execute: async (input: any) => {
           const id = typeof input.id === "string" ? input.id.trim() : ""
-          return { content: editProviderModels(id, input.add, input.remove, providerInputMeta(input)) }
+          return { content: await editProviderModels(id, input.add, input.remove, providerInputMeta(input)) }
         },
       })
     })

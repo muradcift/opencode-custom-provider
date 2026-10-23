@@ -15,10 +15,16 @@ export interface ModelLimit {
 }
 
 export interface ModelEntry {
-  name: string
+  name?: string
   modelID?: string
   capabilities?: ModelCapabilities
   limit?: ModelLimit
+  /**
+   * OpenCode v2 treats `providers.<id>.models` as an overlay on the built-in
+   * models.dev catalog, not as a whitelist. `disabled: true` is the only
+   * subtractive control; it hides a catalog model without deleting its metadata.
+   */
+  disabled?: boolean
 }
 
 export interface ProviderEntry {
@@ -560,7 +566,154 @@ export function providerInputMeta(args: ProviderInput): ModelMetaInput {
   }
 }
 
-export function upsertCustomProvider(rawArgs: ProviderInput): string {
+const CATALOG_URLS = ["https://models.dev/api.json", "https://models.opencode.ai/api.json"]
+const CATALOG_USER_AGENT = "opencode-custom-provider/0.1.3"
+const CATALOG_TIMEOUT_MS = 15000
+const CATALOG_TTL_MS = 10 * 60 * 1000
+
+let catalogCache: { at: number; catalog: Record<string, any> } | undefined
+
+// A truncated or empty response must not be treated as a valid catalog: doing
+// so would prune every disabled stub and let built-in models reappear.
+function isCatalog(value: unknown): value is Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  return Object.values(value).some((provider) => {
+    if (!provider || typeof provider !== "object" || Array.isArray(provider)) return false
+    const models = (provider as Record<string, unknown>).models
+    return Boolean(models && typeof models === "object" && !Array.isArray(models))
+  })
+}
+
+// OpenCode's built-in model catalog. A provider ID that also exists here gets
+// its whole catalog imported before the config overlay is applied, so the
+// plugin needs the catalog to know which IDs have to be written as disabled.
+export async function loadCatalog(): Promise<{ catalog?: Record<string, any>; error?: string }> {
+  const testPath = process.env.OPENCODE_CATALOG_TEST
+  if (testPath) {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(testPath, "utf8"))
+      if (!isCatalog(parsed)) return { error: "empty or invalid catalog" }
+      return { catalog: parsed }
+    } catch (e) {
+      return { error: `cannot read catalog (${testPath}): ${(e as Error).message}` }
+    }
+  }
+  if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+    return { catalog: catalogCache.catalog }
+  }
+  let lastError = "no catalog endpoint reachable"
+  for (const url of CATALOG_URLS) {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), CATALOG_TIMEOUT_MS)
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": CATALOG_USER_AGENT },
+        signal: ctrl.signal,
+      })
+      if (!res.ok) {
+        lastError = `http-${res.status} from ${url}`
+        continue
+      }
+      const parsed: unknown = await res.json()
+      if (!isCatalog(parsed)) {
+        lastError = "empty or invalid catalog"
+        continue
+      }
+      catalogCache = { at: Date.now(), catalog: parsed }
+      return { catalog: parsed }
+    } catch (e) {
+      const err = e as Error
+      lastError = `${url}: ${err.name === "AbortError" ? "timed out" : err.message}`
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return { error: lastError }
+}
+
+function hasTextModality(value: unknown): boolean {
+  if (!Array.isArray(value) || value.length === 0) return true
+  return value.some((m) => typeof m === "string" && m.startsWith("text"))
+}
+
+function catalogModeIDs(experimental: unknown): string[] {
+  if (!experimental || typeof experimental !== "object" || Array.isArray(experimental)) return []
+  const modes = (experimental as Record<string, unknown>).modes
+  if (Array.isArray(modes)) {
+    return modes
+      .map((m) => {
+        if (typeof m === "string") return m
+        if (m && typeof m === "object" && typeof (m as Record<string, unknown>).id === "string") {
+          return (m as Record<string, string>).id
+        }
+        return ""
+      })
+      .filter(Boolean)
+  }
+  if (modes && typeof modes === "object") return Object.keys(modes)
+  return []
+}
+
+// IDs OpenCode itself imports from the catalog for this provider: deprecated
+// and non-text models are filtered out by the runtime, and experimental modes
+// are expanded into `<model>-<mode>` variants.
+export function catalogModelIDs(catalog: Record<string, any> | undefined, providerID: string): string[] {
+  const provider = catalog && catalog[providerID]
+  const models = provider && provider.models
+  if (!models || typeof models !== "object" || Array.isArray(models)) return []
+  const ids: string[] = []
+  for (const [modelID, raw] of Object.entries(models as Record<string, any>)) {
+    const model = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, any>) : {}
+    if (model.status === "deprecated") continue
+    const modalities =
+      model.modalities && typeof model.modalities === "object" && !Array.isArray(model.modalities)
+        ? (model.modalities as Record<string, unknown>)
+        : {}
+    if (!hasTextModality(modalities.input) || !hasTextModality(modalities.output)) continue
+    ids.push(modelID)
+    for (const mode of catalogModeIDs(model.experimental)) ids.push(`${modelID}-${mode}`)
+  }
+  return ids
+}
+
+// Mutates `models` so exactly `selected` stays enabled for a catalog-colliding
+// provider. Catalog IDs that are not selected become `{ disabled: true }`
+// stubs (existing metadata is preserved); stubs that no longer correspond to a
+// catalog model and are not selected are removed again.
+export function applyModelWhitelist(
+  models: Record<string, ModelEntry>,
+  selected: string[],
+  catalogIDs: string[],
+): { hidden: number; pruned: number } {
+  const selectedSet = new Set(selected)
+  const catalogSet = new Set(catalogIDs)
+  let hidden = 0
+  let pruned = 0
+  for (const m of selectedSet) {
+    const entry = models[m]
+    if (entry && entry.disabled !== undefined) delete entry.disabled
+  }
+  for (const m of catalogSet) {
+    if (selectedSet.has(m)) continue
+    const entry = models[m]
+    if (!entry) {
+      models[m] = { disabled: true }
+      hidden++
+    } else if (entry.disabled !== true) {
+      entry.disabled = true
+      hidden++
+    }
+  }
+  for (const [m, entry] of Object.entries(models)) {
+    if (entry.disabled === true && !catalogSet.has(m) && !selectedSet.has(m)) {
+      delete models[m]
+      pruned++
+    }
+  }
+  return { hidden, pruned }
+}
+
+export async function upsertCustomProvider(rawArgs: ProviderInput): Promise<string> {
   const args = normalizeInput(rawArgs)
   const { id, baseURL } = args
   if (!validId(id)) return `Error: invalid provider ID "${id}". Use letters, digits, dot, dash, underscore.`
@@ -625,7 +778,9 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
     }
   }
 
-  const mergedModels: Record<string, ModelEntry> = { ...((previous && previous.models) || {}) }
+  const previousModels = (previous && previous.models) || {}
+  const prevEnabled = Object.keys(previousModels).filter((m) => previousModels[m]?.disabled !== true)
+  const mergedModels: Record<string, ModelEntry> = { ...previousModels }
   mergedModels[args.model] = modelEntry
   for (const m of wanted) {
     const cur = mergedModels[m]
@@ -634,9 +789,34 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
       mergedModels[m] = { name: m, capabilities: r.capabilities, limit: r.limit }
       reportSources[m] = r.sources
     } else {
-      ensureModelMeta(cur)
+      // A disabled stub that is being re-added keeps the metadata it has;
+      // only enabled entries get missing fallback metadata filled in.
+      if (cur.disabled !== true) ensureModelMeta(cur)
       if (!reportSources[m]) reportSources[m] = BASE_SOURCES
     }
+  }
+  // Previously enabled models stay selected, and every explicitly wanted ID
+  // is selected (which also re-enables a disabled stub).
+  const selected = [...new Set([...prevEnabled, ...wanted])]
+  for (const m of selected) {
+    if (mergedModels[m]) delete mergedModels[m].disabled
+  }
+
+  const catalogResult = await loadCatalog()
+  let hidden = 0
+  let catalogWarning: string | undefined
+  if (catalogResult.catalog) {
+    hidden = applyModelWhitelist(
+      mergedModels,
+      selected,
+      catalogModelIDs(catalogResult.catalog, id),
+    ).hidden
+  } else {
+    // Without the catalog we cannot tell which IDs collide, so leave existing
+    // stubs alone instead of pruning them as stale.
+    catalogWarning =
+      `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` +
+      `unselected built-in models may still appear for "${id}".`
   }
   config.providers[id] = {
     name: args.name ?? previous?.name ?? id,
@@ -665,6 +845,13 @@ export function upsertCustomProvider(rawArgs: ProviderInput): string {
     lines.push(`Note: define the ${args.apiKeyEnv} environment variable; no raw key was written.`)
     if (staleKeyRemoved) lines.push(`Note: removed the previously stored raw key for ${id}.`)
   }
+  if (hidden > 0) {
+    lines.push(
+      `Note: ${hidden} unselected built-in catalog model(s) were disabled because provider ID "${id}" ` +
+        `collides with OpenCode's models.dev catalog. Only selected models will appear.`,
+    )
+  }
+  if (catalogWarning) lines.push(catalogWarning)
   lines.push(`Pick ${id}/${args.model} from /models to test.`)
   return lines.join("\n")
 }
@@ -694,12 +881,12 @@ export function removeProvider(rawID: string): string {
   return `Deleted: ${id} (config + stored key).`
 }
 
-export function editProviderModels(
+export async function editProviderModels(
   rawID: string,
   add?: string[],
   remove?: string[],
   meta?: ModelMetaInput,
-): string {
+): Promise<string> {
   const id = trimString(rawID)
   if (!id) return "Error: empty ID."
   const file = globalConfigPath()
@@ -716,6 +903,7 @@ export function editProviderModels(
   const norm = (v: unknown) => trimString(v)
   const hasMeta = meta !== undefined && Object.values(meta).some((v) => v !== undefined)
   const added = (Array.isArray(add) ? add : []).map(norm).filter(Boolean)
+  const removed = (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)
   const reportSources: Record<string, MetaSources> = {}
   for (const m of added) {
     const cur = models[m]
@@ -728,36 +916,94 @@ export function editProviderModels(
       models[m] = { ...cur, capabilities: r.capabilities, limit: r.limit }
       reportSources[m] = r.sources
     } else {
-      ensureModelMeta(cur)
+      // Re-adding a disabled stub only flips it on; do not bloat it with
+      // fallback metadata it never had.
+      if (cur.disabled !== true) ensureModelMeta(cur)
       reportSources[m] = BASE_SOURCES
     }
   }
-  for (const m of (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)) {
-    delete models[m]
-  }
-  if (!Object.keys(models).length) {
+
+  // Enabled models are the selected set. Disabled stubs are hidden, not
+  // selected, unless `add` explicitly names them again.
+  const selectedSet = new Set(
+    Object.keys(models).filter((m) => models[m]?.disabled !== true),
+  )
+  for (const m of removed) selectedSet.delete(m)
+  for (const m of added) selectedSet.add(m)
+  if (!selectedSet.size) {
     return "Error: at least 1 model must remain. Use custom_provider_remove to delete the provider."
   }
+  const selected = [...selectedSet]
+  for (const m of selected) {
+    if (models[m]) delete models[m].disabled
+  }
+
+  const catalogResult = await loadCatalog()
+  let hidden = 0
+  let catalogWarning: string | undefined
+  if (catalogResult.catalog) {
+    const catalogIDs = catalogModelIDs(catalogResult.catalog, id)
+    const catalogSet = new Set(catalogIDs)
+    // A removed catalog model has to stay as a disabled stub, otherwise
+    // OpenCode imports it again. A removed non-catalog model can be deleted.
+    for (const m of removed) {
+      if (!selectedSet.has(m) && !catalogSet.has(m)) delete models[m]
+    }
+    hidden = applyModelWhitelist(models, selected, catalogIDs).hidden
+  } else {
+    // No catalog: a removed model may be a built-in model that OpenCode would
+    // simply import again, so keep it as a disabled stub instead of deleting
+    // it. Unrelated stubs stay too; the next successful catalog load prunes
+    // stubs that are not catalog models.
+    for (const m of removed) {
+      if (selectedSet.has(m)) continue
+      const entry = models[m]
+      if (entry) entry.disabled = true
+    }
+    catalogWarning =
+      `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` +
+      `unselected built-in models may still appear for "${id}".`
+  }
+
   entry.models = models
   try {
     saveConfig(file, config, before)
   } catch (e) {
     return `Error: cannot write config (${file}): ${(e as Error).message}`
   }
-  const out = [`Updated: ${id} -> ${Object.keys(models).length} model(s) (${Object.keys(models).join(", ").slice(0, 300)})`]
+  const out = [`Updated: ${id} -> ${selected.length} model(s) (${selected.join(", ").slice(0, 300)})`]
   if (added.length) {
     out.push("Limits:")
     for (const m of added) out.push(formatMetaReport(`${id}/${m}`, models[m], reportSources[m]))
   }
+  if (hidden > 0) {
+    out.push(
+      `Note: ${hidden} unselected built-in catalog model(s) were disabled because provider ID "${id}" ` +
+        `collides with OpenCode's models.dev catalog. Only selected models will appear.`,
+    )
+  }
+  if (catalogWarning) out.push(catalogWarning)
   return out.join("\n")
 }
 
 export interface ScanResult {
   ids?: string[]
   current?: string[]
+  /** Catalog models written as `disabled: true` to keep them out of the picker. */
+  hidden?: number
+  /** IDs of the disabled stubs; they must not be reported as new/removable. */
+  hiddenIDs?: string[]
   baseURL?: string
   meta?: Record<string, DiscoveredMeta>
   error?: string
+}
+
+// Endpoint models are "new" only when neither enabled nor already present as a
+// disabled stub. Hidden stubs are deliberately excluded from `current`, so the
+// scan output has to combine both sets.
+export function scanNewModels(ids: string[], current: string[], hiddenIDs: string[]): string[] {
+  const known = new Set([...current, ...hiddenIDs])
+  return ids.filter((m) => !known.has(m))
 }
 
 function storedKeyFor(providerID: string, settingsApiKey?: string): string | undefined {
@@ -796,7 +1042,17 @@ export async function scanProviderModels(rawID: string): Promise<ScanResult> {
               : `Endpoint error (${found.error}).`
     return { error: reason, baseURL }
   }
-  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL, meta: discoveredMeta(found.raw) }
+  const configured = entry.models || {}
+  const current = Object.keys(configured).filter((m) => configured[m]?.disabled !== true)
+  const hiddenIDs = Object.keys(configured).filter((m) => configured[m]?.disabled === true)
+  return {
+    ids: found.ids ?? [],
+    current,
+    hidden: hiddenIDs.length,
+    hiddenIDs,
+    baseURL,
+    meta: discoveredMeta(found.raw),
+  }
 }
 
 export function discoveredMeta(raw?: Record<string, unknown>): Record<string, DiscoveredMeta> {

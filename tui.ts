@@ -1,6 +1,8 @@
 import type { Context } from "@opencode-ai/plugin/tui/context"
 import {
+  applyModelWhitelist,
   BASE_SOURCES,
+  catalogModelIDs,
   deleteKeyFileEntry,
   discoverModels,
   ensureModelMeta,
@@ -10,6 +12,7 @@ import {
   globalConfigPath,
   hasDiscoveredLimits,
   listCustomProviders,
+  loadCatalog,
   loadConfig,
   readKeys,
   readConfigText,
@@ -471,9 +474,30 @@ async function writeProvider(
       mergedModels[m] = { name: m, capabilities: metas[m].capabilities, limit: metas[m].limit }
       reportSources[m] = metas[m].sources
     } else {
-      ensureModelMeta(mergedModels[m], raw[m])
+      if (mergedModels[m].disabled !== true) ensureModelMeta(mergedModels[m], raw[m])
       reportSources[m] = BASE_SOURCES
     }
+  }
+  // Existing enabled models stay selected, plus everything picked. A picked
+  // disabled stub is re-enabled; catalog-only extras stay disabled.
+  const selected = Object.keys(mergedModels).filter((m) => mergedModels[m]?.disabled !== true)
+  for (const m of models) if (!selected.includes(m)) selected.push(m)
+  for (const m of selected) {
+    if (mergedModels[m]) delete mergedModels[m].disabled
+  }
+  const catalogResult = await loadCatalog()
+  let hidden = 0
+  let catalogWarning: string | undefined
+  if (catalogResult.catalog) {
+    hidden = applyModelWhitelist(
+      mergedModels,
+      selected,
+      catalogModelIDs(catalogResult.catalog, id),
+    ).hidden
+  } else {
+    catalogWarning =
+      `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` +
+      `unselected built-in models may still appear for "${id}".`
   }
   const prevSettings = previous && previous.settings && typeof previous.settings === "object" ? previous.settings : {}
   config.providers[id] = {
@@ -494,8 +518,20 @@ async function writeProvider(
   const report = models
     .filter((m) => hasDiscoveredLimits(reportSources[m]))
     .map((m) => formatMetaReport(`${id}/${m}`, mergedModels[m], reportSources[m]))
-  const suffix = report.length ? `\n${truncateReport(report).join("\n")}` : ""
-  toast(ctx, `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.${suffix}`, "success")
+  const notes: string[] = []
+  if (hidden > 0) {
+    notes.push(
+      `${hidden} unselected built-in model(s) were disabled because "${id}" collides with OpenCode's catalog. ` +
+        "Use a unique provider ID for a config without disabled stubs.",
+    )
+  }
+  if (catalogWarning) notes.push(catalogWarning)
+  const suffix = [report.length ? truncateReport(report).join("\n") : "", ...notes].filter(Boolean).join("\n")
+  toast(
+    ctx,
+    `Added: ${id} (${models.length} model(s)) -> pick one from /models to test.${suffix ? `\n${suffix}` : ""}`,
+    catalogWarning ? "warning" : "success",
+  )
 }
 
 async function editModelsFlow(ctx: Context) {
@@ -538,7 +574,11 @@ async function editModelsFlow(ctx: Context) {
     }
   }
 
-  const current = new Set<string>(Object.keys(entry.models || {}))
+  const configuredModels = (entry.models as Record<string, ModelEntry> | undefined) || {}
+  // Disabled stubs are not editable models; only enabled ones are selected.
+  const current = new Set<string>(
+    Object.keys(configuredModels).filter((m) => configuredModels[m]?.disabled !== true),
+  )
   if (!current.size && !discovered.length) {
     const manual = await dialog.prompt({ title: "Model ID", placeholder: "coder" })
     const m = (manual || "").trim()
@@ -579,29 +619,61 @@ async function editModelsFlow(ctx: Context) {
     return
   }
   let report: string[] = []
+  let hidden = 0
+  let catalogWarning: string | undefined
   try {
     const file = globalConfigPath()
     const before = readConfigText(file)
     const config = loadConfig(file)
     const target = config.providers[pid]
-    const original = new Set(Object.keys((target.models as Record<string, ModelEntry>) || {}))
+    const existing = (target.models as Record<string, ModelEntry>) || {}
+    const original = new Set(Object.keys(existing))
     const added = [...current].filter((m) => !original.has(m))
     const metas = await resolveModelsMetaUI(ctx, added, discoveredRaw, new Set())
     if (!metas) return
+
+    // Keep every existing entry (including disabled stubs) so removing a
+    // catalog model can leave its metadata behind as a disabled stub.
     const models: Record<string, ModelEntry> = {}
+    for (const [m, e] of Object.entries(existing)) models[m] = { ...e }
     const reportSources: Record<string, MetaSources> = {}
     for (const m of current) {
-      const kept = target.models && (target.models as Record<string, ModelEntry>)[m]
+      const kept = models[m]
       if (kept) {
-        models[m] = ensureModelMeta({ ...kept }, discoveredRaw[m])
+        const copy = { ...kept }
+        delete copy.disabled
+        // Re-enabling a stub keeps its metadata; enabled entries may gain
+        // discovered metadata as before.
+        models[m] = kept.disabled === true ? copy : ensureModelMeta(copy, discoveredRaw[m])
         reportSources[m] = BASE_SOURCES
       } else {
         models[m] = { name: m, capabilities: metas[m].capabilities, limit: metas[m].limit }
         reportSources[m] = metas[m].sources
       }
     }
+
+    const selected = [...current]
+    const catalogResult = await loadCatalog()
+    if (catalogResult.catalog) {
+      const catalogIDs = catalogModelIDs(catalogResult.catalog, pid)
+      const catalogSet = new Set(catalogIDs)
+      // Drop explicitly removed non-catalog models; catalog models stay and
+      // are turned into disabled stubs by the whitelist.
+      for (const m of Object.keys(models)) {
+        if (!current.has(m) && !catalogSet.has(m)) delete models[m]
+      }
+      hidden = applyModelWhitelist(models, selected, catalogIDs).hidden
+    } else {
+      // No catalog: honor removals but keep unrelated disabled stubs.
+      for (const m of Object.keys(models)) {
+        if (!current.has(m) && models[m].disabled !== true) delete models[m]
+      }
+      catalogWarning =
+        `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` +
+        `unselected built-in models may still appear for "${pid}".`
+    }
     target.models = models
-    report = [...current]
+    report = selected
       .filter((m) => hasDiscoveredLimits(reportSources[m]))
       .map((m) => formatMetaReport(`${pid}/${m}`, models[m], reportSources[m]))
     saveConfig(file, config, before)
@@ -610,8 +682,16 @@ async function editModelsFlow(ctx: Context) {
     return
   }
   await syncCatalog(ctx)
-  const suffix = report.length ? `\n${truncateReport(report).join("\n")}` : ""
-  toast(ctx, `Saved: ${pid} (${current.size} model(s)).${suffix}`, "success")
+  const notes: string[] = []
+  if (hidden > 0) {
+    notes.push(
+      `${hidden} unselected built-in model(s) were disabled because "${pid}" collides with OpenCode's catalog. ` +
+        "Use a unique provider ID for a config without disabled stubs.",
+    )
+  }
+  if (catalogWarning) notes.push(catalogWarning)
+  const suffix = [report.length ? truncateReport(report).join("\n") : "", ...notes].filter(Boolean).join("\n")
+  toast(ctx, `Saved: ${pid} (${current.size} model(s)).${suffix ? `\n${suffix}` : ""}`, catalogWarning ? "warning" : "success")
 }
 
 async function deleteFlow(ctx: Context) {

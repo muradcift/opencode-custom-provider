@@ -423,7 +423,138 @@ function providerInputMeta(args) {
     outputModalities: args.outputModalities
   };
 }
-function upsertCustomProvider(rawArgs) {
+var CATALOG_URLS = ["https://models.dev/api.json", "https://models.opencode.ai/api.json"];
+var CATALOG_USER_AGENT = "opencode-custom-provider/0.1.3";
+var CATALOG_TIMEOUT_MS = 15000;
+var CATALOG_TTL_MS = 10 * 60 * 1000;
+var catalogCache;
+function isCatalog(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return false;
+  return Object.values(value).some((provider) => {
+    if (!provider || typeof provider !== "object" || Array.isArray(provider))
+      return false;
+    const models = provider.models;
+    return Boolean(models && typeof models === "object" && !Array.isArray(models));
+  });
+}
+async function loadCatalog() {
+  const testPath = process.env.OPENCODE_CATALOG_TEST;
+  if (testPath) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(testPath, "utf8"));
+      if (!isCatalog(parsed))
+        return { error: "empty or invalid catalog" };
+      return { catalog: parsed };
+    } catch (e) {
+      return { error: `cannot read catalog (${testPath}): ${e.message}` };
+    }
+  }
+  if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+    return { catalog: catalogCache.catalog };
+  }
+  let lastError = "no catalog endpoint reachable";
+  for (const url of CATALOG_URLS) {
+    const ctrl = new AbortController;
+    const timer = setTimeout(() => ctrl.abort(), CATALOG_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": CATALOG_USER_AGENT },
+        signal: ctrl.signal
+      });
+      if (!res.ok) {
+        lastError = `http-${res.status} from ${url}`;
+        continue;
+      }
+      const parsed = await res.json();
+      if (!isCatalog(parsed)) {
+        lastError = "empty or invalid catalog";
+        continue;
+      }
+      catalogCache = { at: Date.now(), catalog: parsed };
+      return { catalog: parsed };
+    } catch (e) {
+      const err = e;
+      lastError = `${url}: ${err.name === "AbortError" ? "timed out" : err.message}`;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { error: lastError };
+}
+function hasTextModality(value) {
+  if (!Array.isArray(value) || value.length === 0)
+    return true;
+  return value.some((m) => typeof m === "string" && m.startsWith("text"));
+}
+function catalogModeIDs(experimental) {
+  if (!experimental || typeof experimental !== "object" || Array.isArray(experimental))
+    return [];
+  const modes = experimental.modes;
+  if (Array.isArray(modes)) {
+    return modes.map((m) => {
+      if (typeof m === "string")
+        return m;
+      if (m && typeof m === "object" && typeof m.id === "string") {
+        return m.id;
+      }
+      return "";
+    }).filter(Boolean);
+  }
+  if (modes && typeof modes === "object")
+    return Object.keys(modes);
+  return [];
+}
+function catalogModelIDs(catalog, providerID) {
+  const provider = catalog && catalog[providerID];
+  const models = provider && provider.models;
+  if (!models || typeof models !== "object" || Array.isArray(models))
+    return [];
+  const ids = [];
+  for (const [modelID, raw] of Object.entries(models)) {
+    const model = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    if (model.status === "deprecated")
+      continue;
+    const modalities = model.modalities && typeof model.modalities === "object" && !Array.isArray(model.modalities) ? model.modalities : {};
+    if (!hasTextModality(modalities.input) || !hasTextModality(modalities.output))
+      continue;
+    ids.push(modelID);
+    for (const mode of catalogModeIDs(model.experimental))
+      ids.push(`${modelID}-${mode}`);
+  }
+  return ids;
+}
+function applyModelWhitelist(models, selected, catalogIDs) {
+  const selectedSet = new Set(selected);
+  const catalogSet = new Set(catalogIDs);
+  let hidden = 0;
+  let pruned = 0;
+  for (const m of selectedSet) {
+    const entry = models[m];
+    if (entry && entry.disabled !== undefined)
+      delete entry.disabled;
+  }
+  for (const m of catalogSet) {
+    if (selectedSet.has(m))
+      continue;
+    const entry = models[m];
+    if (!entry) {
+      models[m] = { disabled: true };
+      hidden++;
+    } else if (entry.disabled !== true) {
+      entry.disabled = true;
+      hidden++;
+    }
+  }
+  for (const [m, entry] of Object.entries(models)) {
+    if (entry.disabled === true && !catalogSet.has(m) && !selectedSet.has(m)) {
+      delete models[m];
+      pruned++;
+    }
+  }
+  return { hidden, pruned };
+}
+async function upsertCustomProvider(rawArgs) {
   const args = normalizeInput(rawArgs);
   const { id, baseURL } = args;
   if (!validId(id))
@@ -483,7 +614,9 @@ function upsertCustomProvider(rawArgs) {
       staleKeyRemoved = true;
     }
   }
-  const mergedModels = { ...previous && previous.models || {} };
+  const previousModels = previous && previous.models || {};
+  const prevEnabled = Object.keys(previousModels).filter((m) => previousModels[m]?.disabled !== true);
+  const mergedModels = { ...previousModels };
   mergedModels[args.model] = modelEntry;
   for (const m of wanted) {
     const cur = mergedModels[m];
@@ -492,10 +625,24 @@ function upsertCustomProvider(rawArgs) {
       mergedModels[m] = { name: m, capabilities: r.capabilities, limit: r.limit };
       reportSources[m] = r.sources;
     } else {
-      ensureModelMeta(cur);
+      if (cur.disabled !== true)
+        ensureModelMeta(cur);
       if (!reportSources[m])
         reportSources[m] = BASE_SOURCES;
     }
+  }
+  const selected = [...new Set([...prevEnabled, ...wanted])];
+  for (const m of selected) {
+    if (mergedModels[m])
+      delete mergedModels[m].disabled;
+  }
+  const catalogResult = await loadCatalog();
+  let hidden = 0;
+  let catalogWarning;
+  if (catalogResult.catalog) {
+    hidden = applyModelWhitelist(mergedModels, selected, catalogModelIDs(catalogResult.catalog, id)).hidden;
+  } else {
+    catalogWarning = `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` + `unselected built-in models may still appear for "${id}".`;
   }
   config.providers[id] = {
     name: args.name ?? previous?.name ?? id,
@@ -523,6 +670,11 @@ function upsertCustomProvider(rawArgs) {
     if (staleKeyRemoved)
       lines.push(`Note: removed the previously stored raw key for ${id}.`);
   }
+  if (hidden > 0) {
+    lines.push(`Note: ${hidden} unselected built-in catalog model(s) were disabled because provider ID "${id}" ` + `collides with OpenCode's models.dev catalog. Only selected models will appear.`);
+  }
+  if (catalogWarning)
+    lines.push(catalogWarning);
   lines.push(`Pick ${id}/${args.model} from /models to test.`);
   return lines.join(`
 `);
@@ -553,7 +705,7 @@ function removeProvider(rawID) {
   deleteKeyFileEntry(id);
   return `Deleted: ${id} (config + stored key).`;
 }
-function editProviderModels(rawID, add, remove, meta) {
+async function editProviderModels(rawID, add, remove, meta) {
   const id = trimString(rawID);
   if (!id)
     return "Error: empty ID.";
@@ -572,6 +724,7 @@ function editProviderModels(rawID, add, remove, meta) {
   const norm = (v) => trimString(v);
   const hasMeta = meta !== undefined && Object.values(meta).some((v) => v !== undefined);
   const added = (Array.isArray(add) ? add : []).map(norm).filter(Boolean);
+  const removed = (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean);
   const reportSources = {};
   for (const m of added) {
     const cur = models[m];
@@ -584,15 +737,44 @@ function editProviderModels(rawID, add, remove, meta) {
       models[m] = { ...cur, capabilities: r.capabilities, limit: r.limit };
       reportSources[m] = r.sources;
     } else {
-      ensureModelMeta(cur);
+      if (cur.disabled !== true)
+        ensureModelMeta(cur);
       reportSources[m] = BASE_SOURCES;
     }
   }
-  for (const m of (Array.isArray(remove) ? remove : []).map(norm).filter(Boolean)) {
-    delete models[m];
-  }
-  if (!Object.keys(models).length) {
+  const selectedSet = new Set(Object.keys(models).filter((m) => models[m]?.disabled !== true));
+  for (const m of removed)
+    selectedSet.delete(m);
+  for (const m of added)
+    selectedSet.add(m);
+  if (!selectedSet.size) {
     return "Error: at least 1 model must remain. Use custom_provider_remove to delete the provider.";
+  }
+  const selected = [...selectedSet];
+  for (const m of selected) {
+    if (models[m])
+      delete models[m].disabled;
+  }
+  const catalogResult = await loadCatalog();
+  let hidden = 0;
+  let catalogWarning;
+  if (catalogResult.catalog) {
+    const catalogIDs = catalogModelIDs(catalogResult.catalog, id);
+    const catalogSet = new Set(catalogIDs);
+    for (const m of removed) {
+      if (!selectedSet.has(m) && !catalogSet.has(m))
+        delete models[m];
+    }
+    hidden = applyModelWhitelist(models, selected, catalogIDs).hidden;
+  } else {
+    for (const m of removed) {
+      if (selectedSet.has(m))
+        continue;
+      const entry = models[m];
+      if (entry)
+        entry.disabled = true;
+    }
+    catalogWarning = `Warning: could not load OpenCode's model catalog (${catalogResult.error}); ` + `unselected built-in models may still appear for "${id}".`;
   }
   entry.models = models;
   try {
@@ -600,14 +782,23 @@ function editProviderModels(rawID, add, remove, meta) {
   } catch (e) {
     return `Error: cannot write config (${file}): ${e.message}`;
   }
-  const out = [`Updated: ${id} -> ${Object.keys(models).length} model(s) (${Object.keys(models).join(", ").slice(0, 300)})`];
+  const out = [`Updated: ${id} -> ${selected.length} model(s) (${selected.join(", ").slice(0, 300)})`];
   if (added.length) {
     out.push("Limits:");
     for (const m of added)
       out.push(formatMetaReport(`${id}/${m}`, models[m], reportSources[m]));
   }
+  if (hidden > 0) {
+    out.push(`Note: ${hidden} unselected built-in catalog model(s) were disabled because provider ID "${id}" ` + `collides with OpenCode's models.dev catalog. Only selected models will appear.`);
+  }
+  if (catalogWarning)
+    out.push(catalogWarning);
   return out.join(`
 `);
+}
+function scanNewModels(ids, current, hiddenIDs) {
+  const known = new Set([...current, ...hiddenIDs]);
+  return ids.filter((m) => !known.has(m));
 }
 function storedKeyFor(providerID, settingsApiKey) {
   const stored = readKeys()[providerID];
@@ -639,7 +830,17 @@ async function scanProviderModels(rawID) {
     const reason = found.error === "auth" ? "Endpoint requires a key (401)." : found.error === "empty" ? "Endpoint returned an empty list." : found.error === "bad-body" ? "Endpoint answered 200 but not with OpenAI-style JSON." : found.error === "network" ? "Endpoint unreachable." : `Endpoint error (${found.error}).`;
     return { error: reason, baseURL };
   }
-  return { ids: found.ids ?? [], current: Object.keys(entry.models || {}), baseURL, meta: discoveredMeta(found.raw) };
+  const configured = entry.models || {};
+  const current = Object.keys(configured).filter((m) => configured[m]?.disabled !== true);
+  const hiddenIDs = Object.keys(configured).filter((m) => configured[m]?.disabled === true);
+  return {
+    ids: found.ids ?? [],
+    current,
+    hidden: hiddenIDs.length,
+    hiddenIDs,
+    baseURL,
+    meta: discoveredMeta(found.raw)
+  };
 }
 function discoveredMeta(raw) {
   const out = {};
@@ -670,7 +871,7 @@ var opencode_custom_provider_default = {
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "custom_provider_add",
-        description: "Add or update a custom OpenAI-compatible provider in the global opencode.jsonc. " + "Ask the user for id, baseURL and model when missing. Never invent URLs or keys. " + "Prefer apiKey (raw key, stored separately) over apiKeyEnv; never write raw secrets into config. " + "Each model is written with explicit limit/capabilities. Run custom_provider_scan first and pass " + "discovered values (contextLimit/outputLimit/inputLimit/tools/modalities); anything omitted falls " + "back to OpenCode defaults (200000 context, 32000 output, tools with text+image in, text out).",
+        description: "Add or update a custom OpenAI-compatible provider in the global opencode.jsonc. " + "Ask the user for id, baseURL and model when missing. Never invent URLs or keys. " + "Prefer apiKey (raw key, stored separately) over apiKeyEnv; never write raw secrets into config. " + "Each model is written with explicit limit/capabilities. Run custom_provider_scan first and pass " + "discovered values (contextLimit/outputLimit/inputLimit/tools/modalities); anything omitted falls " + "back to OpenCode defaults (200000 context, 32000 output, tools with text+image in, text out). " + "OpenCode treats providers.<id>.models as an overlay on its built-in models.dev catalog, not as a " + "whitelist: when the ID matches a catalog provider, unselected catalog models are written as " + "disabled: true so only the selected models appear. Prefer a unique provider ID when you want a " + "clean config without disabled stubs.",
         input: {
           type: "object",
           properties: {
@@ -695,7 +896,7 @@ var opencode_custom_provider_default = {
           additionalProperties: false
         },
         execute: async (input) => {
-          return { content: upsertCustomProvider(input) };
+          return { content: await upsertCustomProvider(input) };
         }
       });
       editor.add({
@@ -730,7 +931,7 @@ var opencode_custom_provider_default = {
           const r = await scanProviderModels(id);
           if (r.error)
             return { content: `Scan failed (${id}): ${r.error}` };
-          const fresh = (r.ids ?? []).filter((m) => !(r.current ?? []).includes(m));
+          const fresh = scanNewModels(r.ids ?? [], r.current ?? [], r.hiddenIDs ?? []);
           const gone = (r.current ?? []).filter((m) => !(r.ids ?? []).includes(m));
           const metaLines = Object.entries(r.meta ?? {}).map(([m, mt]) => {
             const bits = [
@@ -748,6 +949,7 @@ var opencode_custom_provider_default = {
             `Discovered: ${(r.ids ?? []).length} model(s)`,
             fresh.length ? `New (addable): ${fresh.join(", ").slice(0, 500)}` : "No new models.",
             gone.length ? `Missing upstream (removable): ${gone.join(", ").slice(0, 300)}` : "",
+            r.hidden ? `Hidden (disabled): ${r.hidden} built-in catalog model(s), not shown in /models.` : "",
             metaLines.length ? `Discovered limits: ${metaLines.join("; ").slice(0, 500)}` : ""
           ].filter(Boolean);
           return { content: lines.join(`
@@ -756,7 +958,7 @@ var opencode_custom_provider_default = {
       });
       editor.add({
         name: "custom_provider_edit_models",
-        description: "Add and/or remove models of an existing custom provider. At least 1 model must remain. " + "Added models are written with explicit limit/capabilities: pass discovered values from " + "custom_provider_scan (or ask the user); anything omitted falls back to OpenCode defaults " + "(200000 context, 32000 output, tools with text+image in, text out). " + "Confirm the model list with the user before calling.",
+        description: "Add and/or remove models of an existing custom provider. At least 1 model must remain enabled. " + "Added models are written with explicit limit/capabilities: pass discovered values from " + "custom_provider_scan (or ask the user); anything omitted falls back to OpenCode defaults " + "(200000 context, 32000 output, tools with text+image in, text out). " + "OpenCode treats providers.<id>.models as an overlay on its built-in models.dev catalog, not as a " + "whitelist: for a colliding provider ID, unselected catalog models are kept as disabled: true " + "stubs (removing one does not delete it) and newly colliding IDs get added as disabled stubs. " + "Prefer a unique provider ID when you want a clean config. " + "Confirm the model list with the user before calling.",
         input: {
           type: "object",
           properties: {
@@ -775,7 +977,7 @@ var opencode_custom_provider_default = {
         },
         execute: async (input) => {
           const id = typeof input.id === "string" ? input.id.trim() : "";
-          return { content: editProviderModels(id, input.add, input.remove, providerInputMeta(input)) };
+          return { content: await editProviderModels(id, input.add, input.remove, providerInputMeta(input)) };
         }
       });
     });

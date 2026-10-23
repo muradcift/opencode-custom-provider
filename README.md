@@ -28,6 +28,7 @@ Keys are kept in `.custom-provider-keys.json` (`0600`) and injected per request.
 
 Notes:
 
+- OpenCode v2 treats `providers.<id>.models` as an **overlay** on its built-in models.dev catalog, not as a whitelist. If your provider ID also exists in that catalog (e.g. `nvidia`), OpenCode imports every catalog model first and only then applies your entries. The plugin fetches the catalog (`models.dev/api.json`) and writes `disabled: true` stubs for all unselected catalog models, because `disabled` is the only way to subtract a built-in model. Removing such a model keeps its stub (otherwise it reappears); re-adding it clears `disabled`. Prefer a unique provider ID (e.g. `nvidia-local`) when you want a config with no disabled stubs. If the catalog cannot be fetched, the provider is still written but unselected built-in models may temporarily remain visible.
 - Every save rewrites `opencode.jsonc` as plain JSON, so your comments there are lost. A timestamped backup (`opencode.jsonc.bak-*`) is written next to it first.
 - Every save also refuses to write when the config changed on disk since it was read (another session, `opencode plugin add`, a hand edit). Without that check a read-modify-write silently dropped whatever the other writer had added — including the whole `providers` block. Re-run the command and it applies on top of the current file.
 - The TUI Add flow only takes a raw key (or empty); for `{env:VAR}`-based auth use the `custom_provider_add` tool with `apiKeyEnv`.
