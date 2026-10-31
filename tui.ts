@@ -20,6 +20,7 @@ import {
   saveConfig,
   validBaseURL,
   validId,
+  deriveProviderId,
   writeKeyFile,
   type MetaSources,
   type ModelCapabilities,
@@ -65,27 +66,35 @@ function toast(ctx: Context, message: string, variant: "info" | "success" | "war
 async function addFlow(ctx: Context) {
   const dialog = ctx.ui.dialog
 
-  const rawId = await dialog.prompt({
-    title: "Provider ID",
-    description: "Lowercase, digits, dot, dash. E.g. acme",
-    placeholder: "acme",
+  // Ask for the endpoint first: many users paste the URL where an ID is
+  // expected, which used to produce a confusing "not accepted" error.
+  const rawBaseURL = await dialog.prompt({
+    title: "Base URL",
+    description: "OpenAI-compatible endpoint. E.g. https://llm.onerouter.pro/v1",
+    placeholder: "https://llm.onerouter.pro/v1",
   })
-  if (!rawId) return
-  const id = rawId.trim()
-  if (!id || !validId(id)) {
-    await dialog.alert({ title: "Invalid ID", message: `"${id}" is not accepted. Use letters, digits, dot, dash, underscore.` })
+  if (!rawBaseURL) return
+  let baseURL = rawBaseURL.trim()
+  if (!baseURL || !validBaseURL(baseURL)) {
+    await dialog.alert({ title: "Invalid URL", message: `"${baseURL}" is not an http(s) URL.` })
     return
   }
 
-  const rawBaseURL = await dialog.prompt({
-    title: "Base URL",
-    description: "OpenAI-compatible endpoint. E.g. https://llm.acme.example/v1",
-    placeholder: "https://llm.acme.example/v1",
+  const suggestedId = deriveProviderId(baseURL)
+  const rawId = await dialog.prompt({
+    title: "Provider ID",
+    description: "Short name for this provider (not the URL). E.g. onerouter",
+    placeholder: suggestedId || "acme",
   })
-  if (!rawBaseURL) return
-  const baseURL = rawBaseURL.trim()
-  if (!baseURL || !validBaseURL(baseURL)) {
-    await dialog.alert({ title: "Invalid URL", message: `"${baseURL}" is not an http(s) URL.` })
+  if (rawId === undefined) return
+  let id = (rawId || "").trim()
+  if (!id) id = suggestedId
+  // If a URL slipped in here, derive from it instead of rejecting.
+  if (!validId(id) && validBaseURL(id)) {
+    id = deriveProviderId(id)
+  }
+  if (!id || !validId(id)) {
+    await dialog.alert({ title: "Invalid ID", message: `"${id}" is not accepted. Use letters, digits, dot, dash, underscore.` })
     return
   }
 

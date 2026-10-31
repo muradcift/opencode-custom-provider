@@ -352,6 +352,26 @@ function validBaseURL(value) {
     return false;
   }
 }
+function deriveProviderId(value) {
+  let host = "";
+  try {
+    host = new URL(value).hostname;
+  } catch {
+    host = value;
+  }
+  host = host.replace(/^www\./i, "").trim().toLowerCase();
+  let id = host.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!id || !validId(id)) {
+    const first = host.split(".")[0]?.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (first && validId(first))
+      id = first;
+  }
+  if (!id || !validId(id))
+    id = "provider";
+  if (!validId(id))
+    return "";
+  return id;
+}
 async function discoverModels(baseURL, apiKey) {
   const url = baseURL.replace(/\/+$/, "") + "/models";
   try {
@@ -556,9 +576,19 @@ function applyModelWhitelist(models, selected, catalogIDs) {
 }
 async function upsertCustomProvider(rawArgs) {
   const args = normalizeInput(rawArgs);
-  const { id, baseURL } = args;
+  let { id, baseURL } = args;
+  if (!validId(id) && validBaseURL(id)) {
+    if (!validBaseURL(baseURL))
+      baseURL = id;
+    id = deriveProviderId(baseURL);
+    args.baseURL = baseURL;
+  }
+  if (!validId(id) && validBaseURL(baseURL)) {
+    id = deriveProviderId(baseURL);
+  }
+  args.id = id;
   if (!validId(id))
-    return `Error: invalid provider ID "${id}". Use letters, digits, dot, dash, underscore.`;
+    return `Error: invalid provider ID "${id}". Use letters, digits, dot, dash, underscore. (IDs are short names like "onerouter", not full URLs.)`;
   if (!validBaseURL(baseURL))
     return `Error: invalid baseURL "${baseURL}". Expected https://example.com/v1.`;
   const file = globalConfigPath();
@@ -875,7 +905,7 @@ var opencode_custom_provider_default = {
         input: {
           type: "object",
           properties: {
-            id: { type: "string", description: "Provider ID, e.g. acme" },
+            id: { type: "string", description: "Provider ID, e.g. acme. Optional: derived from the base URL hostname if omitted or if a URL is passed." },
             baseURL: { type: "string", description: "OpenAI-compatible base URL, e.g. https://llm.acme.example/v1" },
             model: { type: "string", description: "Catalog model ID, e.g. coder" },
             name: { type: "string", description: "Display name. Defaults to id." },
@@ -892,7 +922,7 @@ var opencode_custom_provider_default = {
             inputModalities: { type: "array", items: { type: "string" }, description: 'Input modalities for `model`, e.g. ["text","image"].' },
             outputModalities: { type: "array", items: { type: "string" }, description: 'Output modalities for `model`, e.g. ["text"].' }
           },
-          required: ["id", "baseURL", "model"],
+          required: ["baseURL", "model"],
           additionalProperties: false
         },
         execute: async (input) => {

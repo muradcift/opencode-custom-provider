@@ -490,6 +490,27 @@ export function validBaseURL(value: string): boolean {
   }
 }
 
+// Derive a safe provider ID from a base URL's hostname, so users who paste
+// an endpoint URL where an ID is expected still end up with a usable entry
+// instead of a confusing "not accepted" error.
+export function deriveProviderId(value: string): string {
+  let host = ""
+  try {
+    host = new URL(value).hostname
+  } catch {
+    host = value
+  }
+  host = host.replace(/^www\./i, "").trim().toLowerCase()
+  let id = host.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "")
+  if (!id || !validId(id)) {
+    const first = host.split(".")[0]?.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "")
+    if (first && validId(first)) id = first
+  }
+  if (!id || !validId(id)) id = "provider"
+  if (!validId(id)) return ""
+  return id
+}
+
 export interface Discovery {
   ids?: string[]
   raw?: Record<string, unknown>
@@ -715,8 +736,19 @@ export function applyModelWhitelist(
 
 export async function upsertCustomProvider(rawArgs: ProviderInput): Promise<string> {
   const args = normalizeInput(rawArgs)
-  const { id, baseURL } = args
-  if (!validId(id)) return `Error: invalid provider ID "${id}". Use letters, digits, dot, dash, underscore.`
+  let { id, baseURL } = args
+  // If the caller passed an endpoint URL where an ID was expected, treat it as
+  // the base URL and derive a safe ID from its hostname instead of rejecting.
+  if (!validId(id) && validBaseURL(id)) {
+    if (!validBaseURL(baseURL)) baseURL = id
+    id = deriveProviderId(baseURL)
+    args.baseURL = baseURL
+  }
+  if (!validId(id) && validBaseURL(baseURL)) {
+    id = deriveProviderId(baseURL)
+  }
+  args.id = id
+  if (!validId(id)) return `Error: invalid provider ID "${id}". Use letters, digits, dot, dash, underscore. (IDs are short names like "onerouter", not full URLs.)`
   if (!validBaseURL(baseURL)) return `Error: invalid baseURL "${baseURL}". Expected https://example.com/v1.`
 
   const file = globalConfigPath()

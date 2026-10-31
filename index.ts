@@ -29,7 +29,7 @@ export default {
         input: {
           type: "object",
           properties: {
-            id: { type: "string", description: "Provider ID, e.g. acme" },
+            id: { type: "string", description: "Provider ID, e.g. acme. Optional: derived from the base URL hostname if omitted or if a URL is passed." },
             baseURL: { type: "string", description: "OpenAI-compatible base URL, e.g. https://llm.acme.example/v1" },
             model: { type: "string", description: "Catalog model ID, e.g. coder" },
             name: { type: "string", description: "Display name. Defaults to id." },
@@ -46,7 +46,7 @@ export default {
             inputModalities: { type: "array", items: { type: "string" }, description: 'Input modalities for `model`, e.g. ["text","image"].' },
             outputModalities: { type: "array", items: { type: "string" }, description: 'Output modalities for `model`, e.g. ["text"].' },
           },
-          required: ["id", "baseURL", "model"],
+          required: ["baseURL", "model"],
           additionalProperties: false,
         },
         execute: async (input: unknown) => {
