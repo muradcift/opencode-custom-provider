@@ -70,8 +70,8 @@ async function addFlow(ctx: Context) {
   // expected, which used to produce a confusing "not accepted" error.
   const rawBaseURL = await dialog.prompt({
     title: "Base URL",
-    description: "OpenAI-compatible endpoint. E.g. https://llm.onerouter.pro/v1",
-    placeholder: "https://llm.onerouter.pro/v1",
+    description: "OpenAI-compatible endpoint. E.g. https://llm.acme.example/v1",
+    placeholder: "https://llm.acme.example/v1",
   })
   if (!rawBaseURL) return
   let baseURL = rawBaseURL.trim()
